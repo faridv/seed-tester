@@ -26,27 +26,51 @@ namespace RockeyPasswordTester
 
     public partial class MainForm : Form
     {
+        private const ushort RY_FIND = 1;
+        private const ushort RY_OPEN = 3;
+        private const ushort RY_CLOSE = 4;
+        private const ushort RY_SEED = 8;
+        private const int MAX_CONSECUTIVE_SEED_ERRORS = 10;
+
         private CancellationTokenSource? _cancellationTokenSource;
         private StreamWriter? _logWriter;
-        private int _seedsTested = 0;
-        private int _matchesFound = 0;
-        private int _verifiedPasswords = 0;
+        private long _seedsTested = 0;
+        private long _matchesFound = 0;
+        private long _verifiedPasswords = 0;
         private Stopwatch _sw = new Stopwatch();
         private SpeedMode _speedMode = SpeedMode.Balanced;
         private TestMode _testMode = TestMode.Dictionary;
         private StringBuilder _logBuffer = new StringBuilder();
         private const int LOG_BUFFER_SIZE = 1000;
+        private const int LOG_FLUSH_LINE_COUNT = 100;
+        private int _logBufferedLines = 0;
+        private bool _hasFlushedFirstLogLine = false;
         private long _totalSeedsToTest = 0;
         private string _lastTestedSeed = string.Empty;
         private bool _isPaused = false;
-        private DateTime _lastUIUpdate = DateTime.MinValue;
 
         private System.Windows.Forms.Timer _uiTimer;
-        private volatile int _uiTested;
-        private volatile int _uiGenerated;
-        private volatile int _uiVerified;
+        private long _uiTested;
+        private long _uiGenerated;
+        private long _uiVerified;
         private long _uiTotal;
         private readonly object _uiTotalLock = new object();
+        private readonly object _logLock = new object();
+
+        private sealed class ResumeInfo
+        {
+            public string LastSeed { get; set; } = string.Empty;
+            public bool HasLastSeed => !string.IsNullOrEmpty(LastSeed);
+        }
+
+        private delegate void DongleOperation(
+            Rockey4SmartClass.Rockey4Smart r4s,
+            ushort handle,
+            ushort p1,
+            ushort p2,
+            ushort p3,
+            ushort p4,
+            CancellationToken cancellationToken);
 
         public MainForm()
         {
@@ -82,19 +106,23 @@ namespace RockeyPasswordTester
             if (total <= 0)
                 return;
 
+            long tested = Volatile.Read(ref _uiTested);
+            long generated = Volatile.Read(ref _uiGenerated);
+            long verified = Volatile.Read(ref _uiVerified);
+
             double elapsed = _sw.Elapsed.TotalSeconds;
-            double speed = elapsed > 0 ? _uiTested / elapsed : 0;
-            long remaining = total - _uiTested;
+            double speed = elapsed > 0 ? tested / elapsed : 0;
+            long remaining = Math.Max(0, total - tested);
             double etaSeconds = speed > 0 ? remaining / speed : 0;
             string eta = etaSeconds > 0 ? TimeSpan.FromSeconds(etaSeconds).ToString("c") : "N/A";
 
-            lblSeedsTested.Text = $"{_uiTested:N0}";
-            lblMatchesFound.Text = $"{_uiGenerated:N0}";
-            lblVerified.Text = $"{_uiVerified:N0}";
+            lblSeedsTested.Text = $"{tested:N0}";
+            lblMatchesFound.Text = $"{generated:N0}";
+            lblVerified.Text = $"{verified:N0}";
             lblSpeed.Text = $"{speed:F1} seeds/sec";
             lblRemaining.Text = $"{remaining:N0}";
             lblETA.Text = eta;
-            lblStatus.Text = $"Testing... {_uiTested:N0}/{total:N0} seeds, {_uiGenerated:N0} generated, {_uiVerified:N0} verified ({(_uiTested * 100.0 / total):F1}%)";
+            lblStatus.Text = $"Testing... {tested:N0}/{total:N0} seeds, {generated:N0} generated, {verified:N0} verified ({(tested * 100.0 / total):F1}%)";
             if (!string.IsNullOrEmpty(_lastTestedSeed))
             {
                 txtLastSeed.Text = _lastTestedSeed;
@@ -195,6 +223,13 @@ namespace RockeyPasswordTester
             _seedsTested = 0;
             _matchesFound = 0;
             _verifiedPasswords = 0;
+            _lastTestedSeed = string.Empty;
+            lock (_logLock)
+            {
+                _logBuffer.Clear();
+                _logBufferedLines = 0;
+                _hasFlushedFirstLogLine = false;
+            }
             lblSeedsTested.Text = "0";
             lblMatchesFound.Text = "0";
             lblVerified.Text = "0";
@@ -209,12 +244,19 @@ namespace RockeyPasswordTester
                              radSpeedBalanced.Checked ? SpeedMode.Balanced : SpeedMode.Slow;
 
                 string targetPassword = txtTargetPassword.Text.Trim();
-                HashSet<string> testedSeeds = LoadTestedSeeds(txtLogFile.Text);
+                string logFilePath = ResolveLogFilePath(txtLogFile.Text);
+                txtLogFile.Text = logFilePath;
 
-                bool isResume = testedSeeds.Count > 0;
+                ResumeInfo resumeInfo = LoadResumeInfo(logFilePath);
+                bool isResume = resumeInfo.HasLastSeed;
+                if (isResume)
+                {
+                    _lastTestedSeed = resumeInfo.LastSeed;
+                    txtLastSeed.Text = _lastTestedSeed;
+                }
 
-                _logWriter = new StreamWriter(txtLogFile.Text, true, Encoding.UTF8);
-                bool headerWritten = File.Exists(txtLogFile.Text) && new FileInfo(txtLogFile.Text).Length > 0;
+                _logWriter = new StreamWriter(new FileStream(logFilePath, FileMode.Append, FileAccess.Write, FileShare.Read), Encoding.UTF8);
+                bool headerWritten = File.Exists(logFilePath) && new FileInfo(logFilePath).Length > 0;
 
                 if (!headerWritten)
                 {
@@ -228,7 +270,7 @@ namespace RockeyPasswordTester
                     seeds = await LoadSeedsAsync(txtSeedListFile.Text);
                     if (isResume)
                     {
-                        lblStatus.Text = $"Resume mode: Found {testedSeeds.Count:N0} already tested seeds. Loading remaining...";
+                        lblStatus.Text = $"Resume mode: Last logged seed is {resumeInfo.LastSeed}. Loading remaining...";
                     }
                     else
                     {
@@ -239,7 +281,7 @@ namespace RockeyPasswordTester
                 {
                     if (isResume)
                     {
-                        lblStatus.Text = $"Resume mode: Found {testedSeeds.Count:N0} already tested seeds. Will skip them...";
+                        lblStatus.Text = $"Resume mode: Last logged seed is {resumeInfo.LastSeed}. Will continue after it...";
                     }
                     else
                     {
@@ -247,73 +289,59 @@ namespace RockeyPasswordTester
                     }
                 }
 
-                UpdateDongleInfo();
-
                 ushort p1 = 0x530A;
                 ushort p2 = 0x00FC;
                 ushort p3 = 0xCB51;
                 ushort p4 = 0x8C4E;
 
-                if (ushort.TryParse(txtP1.Text, System.Globalization.NumberStyles.HexNumber, null, out p1)) { }
-                if (ushort.TryParse(txtP2.Text, System.Globalization.NumberStyles.HexNumber, null, out p2)) { }
-                if (ushort.TryParse(txtP3.Text, System.Globalization.NumberStyles.HexNumber, null, out p3)) { }
-                if (ushort.TryParse(txtP4.Text, System.Globalization.NumberStyles.HexNumber, null, out p4)) { }
-
-                Rockey4SmartClass.Rockey4Smart r4s = new Rockey4SmartClass.Rockey4Smart();
-                ushort handle = 0;
-                uint lp1 = 0;
-                uint lp2 = 0;
-                byte[] buffer = new byte[1024];
-
-                ushort retcode = r4s.Rockey(1, ref handle, ref lp1, ref lp2, ref p1, ref p2, ref p3, ref p4, buffer);
-
-                if (retcode != 0)
-                {
-                    MessageBox.Show($"ROCKEY not found! Error code: {retcode}", "Error",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    lblStatus.Text = "ROCKEY not found!";
-                    return;
-                }
-
-                retcode = r4s.Rockey(3, ref handle, ref lp1, ref lp2, ref p1, ref p2, ref p3, ref p4, buffer);
-
-                if (retcode != 0)
-                {
-                    MessageBox.Show($"Failed to open dongle. Error code: {retcode}", "Error",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    lblStatus.Text = "Failed to open dongle.";
-                    return;
-                }
-
-                this.Invoke((MethodInvoker)delegate
-                {
-                    lblHandle.Text = $"0x{handle:X4}";
-                });
+                if (ushort.TryParse(txtP1.Text, NumberStyles.HexNumber, null, out ushort parsedP1)) p1 = parsedP1;
+                if (ushort.TryParse(txtP2.Text, NumberStyles.HexNumber, null, out ushort parsedP2)) p2 = parsedP2;
+                if (ushort.TryParse(txtP3.Text, NumberStyles.HexNumber, null, out ushort parsedP3)) p3 = parsedP3;
+                if (ushort.TryParse(txtP4.Text, NumberStyles.HexNumber, null, out ushort parsedP4)) p4 = parsedP4;
 
                 _sw.Restart();
 
-                _uiTested = 0;
-                _uiGenerated = 0;
-                _uiVerified = 0;
-                _uiTotal = 0;
+                Interlocked.Exchange(ref _uiTested, 0);
+                Interlocked.Exchange(ref _uiGenerated, 0);
+                Interlocked.Exchange(ref _uiVerified, 0);
+                UiTotal = 0;
                 _uiTimer.Start();
 
                 if (_testMode == TestMode.Dictionary)
                 {
-                    List<string> untestedSeeds = seeds.Where(s => !testedSeeds.Contains(s)).ToList();
-                    _totalSeedsToTest = untestedSeeds.Count;
-                    _uiTotal = untestedSeeds.Count; // Set total for timer updates
-
-                    if (testedSeeds.Count > 0)
+                    int startIndex = 0;
+                    if (isResume)
                     {
-                        lblStatus.Text = $"Resume: Skipping {testedSeeds.Count:N0} tested seeds. Testing {untestedSeeds.Count:N0} remaining seeds...";
+                        int lastSeedIndex = seeds.FindLastIndex(s => string.Equals(s, resumeInfo.LastSeed, StringComparison.Ordinal));
+                        if (lastSeedIndex >= 0)
+                        {
+                            startIndex = lastSeedIndex + 1;
+                        }
+                        else
+                        {
+                            lblStatus.Text = $"Resume seed {resumeInfo.LastSeed} was not found in the seed list. Testing from the beginning...";
+                        }
+                    }
+
+                    List<string> untestedSeeds = startIndex < seeds.Count
+                        ? seeds.Skip(startIndex).ToList()
+                        : new List<string>();
+                    _totalSeedsToTest = untestedSeeds.Count;
+                    UiTotal = untestedSeeds.Count; // Set total for timer updates
+
+                    if (isResume && startIndex > 0)
+                    {
+                        lblStatus.Text = $"Resume: Continuing after {resumeInfo.LastSeed}. Testing {untestedSeeds.Count:N0} remaining seeds...";
                     }
                     else
                     {
                         lblStatus.Text = $"Testing {untestedSeeds.Count:N0} seeds...";
                     }
 
-                    await TestSeedsAsync(untestedSeeds, r4s, handle, p1, p2, p3, p4, targetPassword, _cancellationTokenSource.Token);
+                    await RunOnStaThreadAsync(() => RunWithOpenDongle(p1, p2, p3, p4, (r4s, handle, openP1, openP2, openP3, openP4, token) =>
+                    {
+                        TestSeeds(untestedSeeds, r4s, handle, openP1, openP2, openP3, openP4, targetPassword, token);
+                    }, _cancellationTokenSource.Token));
                 }
                 else
                 {
@@ -321,22 +349,37 @@ namespace RockeyPasswordTester
                     int length = (int)nudLength.Value;
                     long? limit = chkLimit.Checked ? (long?)nudLimit.Value : null;
 
-                    _totalSeedsToTest = limit.HasValue ? limit.Value : (long)Math.Pow(charset.Length, length);
-                    _uiTotal = _totalSeedsToTest; // Set total for timer updates
-
-                    if (testedSeeds.Count > 0)
+                    long totalCombinations = limit.HasValue ? limit.Value : (long)Math.Pow(charset.Length, length);
+                    long startIndex = 0;
+                    if (isResume)
                     {
-                        lblStatus.Text = $"Resume: Will skip {testedSeeds.Count:N0} tested seeds. Testing up to {_totalSeedsToTest:N0} combinations...";
+                        if (TryGetCombinationIndex(resumeInfo.LastSeed, charset, length, out long lastCombinationIndex) && lastCombinationIndex < totalCombinations)
+                        {
+                            startIndex = lastCombinationIndex + 1;
+                        }
+                        else
+                        {
+                            lblStatus.Text = $"Resume seed {resumeInfo.LastSeed} is not in the current brute-force range. Testing from the beginning...";
+                        }
+                    }
+
+                    _totalSeedsToTest = Math.Max(0, totalCombinations - startIndex);
+                    UiTotal = _totalSeedsToTest; // Set total for timer updates
+
+                    if (isResume && startIndex > 0)
+                    {
+                        lblStatus.Text = $"Resume: Continuing after {resumeInfo.LastSeed}. Testing {_totalSeedsToTest:N0} remaining combinations...";
                     }
                     else
                     {
                         lblStatus.Text = $"Brute-forcing up to {_totalSeedsToTest:N0} combinations...";
                     }
 
-                    await TestCombinationsAsync(charset, length, limit, testedSeeds, r4s, handle, p1, p2, p3, p4, targetPassword, _cancellationTokenSource.Token);
+                    await RunOnStaThreadAsync(() => RunWithOpenDongle(p1, p2, p3, p4, (r4s, handle, openP1, openP2, openP3, openP4, token) =>
+                    {
+                        TestCombinations(charset, length, limit, startIndex, r4s, handle, openP1, openP2, openP3, openP4, targetPassword, token);
+                    }, _cancellationTokenSource.Token));
                 }
-
-                r4s.Rockey(4, ref handle, ref lp1, ref lp2, ref p1, ref p2, ref p3, ref p4, buffer);
 
                 _sw.Stop();
 
@@ -348,6 +391,8 @@ namespace RockeyPasswordTester
                     lblSeedsTested.Text = $"{_seedsTested:N0}";
                     lblMatchesFound.Text = $"{_matchesFound:N0}";
                     lblVerified.Text = $"{_verifiedPasswords:N0}";
+                    lblDongleStatus.Text = "Closed";
+                    lblDongleStatus.ForeColor = System.Drawing.Color.Gray;
                     lblHandle.Text = "Closed";
                     if (!string.IsNullOrEmpty(_lastTestedSeed))
                     {
@@ -360,6 +405,14 @@ namespace RockeyPasswordTester
                 _sw.Stop();
                 _uiTimer.Stop();
                 lblStatus.Text = "Testing cancelled.";
+            }
+            catch (InvalidOperationException ex)
+            {
+                _sw.Stop();
+                _uiTimer.Stop();
+                MessageBox.Show(ex.Message, "Testing stopped",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                lblStatus.Text = "Testing stopped.";
             }
             catch (Exception ex)
             {
@@ -411,6 +464,96 @@ namespace RockeyPasswordTester
             txtResults.Clear();
         }
 
+        private string ResolveLogFilePath(string logFilePath)
+        {
+            string trimmedPath = logFilePath.Trim();
+            if (Path.IsPathRooted(trimmedPath))
+            {
+                return trimmedPath;
+            }
+
+            return Path.GetFullPath(trimmedPath);
+        }
+
+        private Task RunOnStaThreadAsync(Action action)
+        {
+            var completion = new TaskCompletionSource<object?>();
+            Thread thread = new Thread(() =>
+            {
+                try
+                {
+                    action();
+                    completion.SetResult(null);
+                }
+                catch (Exception ex)
+                {
+                    completion.SetException(ex);
+                }
+            });
+
+            thread.IsBackground = true;
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.Start();
+            return completion.Task;
+        }
+
+        private void RunWithOpenDongle(ushort p1, ushort p2, ushort p3, ushort p4, DongleOperation operation, CancellationToken cancellationToken)
+        {
+            Rockey4SmartClass.Rockey4Smart r4s = new Rockey4SmartClass.Rockey4Smart();
+            ushort handle = 0;
+            uint lp1 = 0;
+            uint lp2 = 0;
+            byte[] buffer = new byte[1024];
+            bool opened = false;
+
+            ushort openP1 = p1;
+            ushort openP2 = p2;
+            ushort openP3 = p3;
+            ushort openP4 = p4;
+
+            try
+            {
+                ushort retcode = r4s.Rockey(RY_FIND, ref handle, ref lp1, ref lp2, ref openP1, ref openP2, ref openP3, ref openP4, buffer);
+                if (retcode != 0)
+                {
+                    throw new InvalidOperationException($"ROCKEY not found. RY_FIND returned error code {retcode}.");
+                }
+
+                openP1 = p1;
+                openP2 = p2;
+                openP3 = p3;
+                openP4 = p4;
+                retcode = r4s.Rockey(RY_OPEN, ref handle, ref lp1, ref lp2, ref openP1, ref openP2, ref openP3, ref openP4, buffer);
+                if (retcode != 0)
+                {
+                    throw new InvalidOperationException($"Failed to open dongle. RY_OPEN returned error code {retcode}.");
+                }
+
+                opened = true;
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    lblDongleStatus.Text = "Connected ✓";
+                    lblDongleStatus.ForeColor = System.Drawing.Color.Green;
+                    lblHandle.Text = $"0x{handle:X4}";
+                });
+
+                operation(r4s, handle, openP1, openP2, openP3, openP4, cancellationToken);
+            }
+            finally
+            {
+                if (opened)
+                {
+                    r4s.Rockey(RY_CLOSE, ref handle, ref lp1, ref lp2, ref openP1, ref openP2, ref openP3, ref openP4, buffer);
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        lblDongleStatus.Text = "Closed";
+                        lblDongleStatus.ForeColor = System.Drawing.Color.Gray;
+                        lblHandle.Text = "Closed";
+                    });
+                }
+            }
+        }
+
         private void UpdateDongleInfo()
         {
             try
@@ -423,20 +566,28 @@ namespace RockeyPasswordTester
                 ushort p2 = 0x00FC;
                 ushort p3 = 0xCB51;
                 ushort p4 = 0x8C4E;
+                if (ushort.TryParse(txtP1.Text, NumberStyles.HexNumber, null, out ushort parsedP1)) p1 = parsedP1;
+                if (ushort.TryParse(txtP2.Text, NumberStyles.HexNumber, null, out ushort parsedP2)) p2 = parsedP2;
+                if (ushort.TryParse(txtP3.Text, NumberStyles.HexNumber, null, out ushort parsedP3)) p3 = parsedP3;
+                if (ushort.TryParse(txtP4.Text, NumberStyles.HexNumber, null, out ushort parsedP4)) p4 = parsedP4;
                 byte[] buffer = new byte[1024];
 
-                ushort retcode = r4s.Rockey(1, ref handle, ref lp1, ref lp2, ref p1, ref p2, ref p3, ref p4, buffer);
+                ushort findP1 = p1;
+                ushort findP2 = p2;
+                ushort findP3 = p3;
+                ushort findP4 = p4;
+                ushort retcode = r4s.Rockey(RY_FIND, ref handle, ref lp1, ref lp2, ref findP1, ref findP2, ref findP3, ref findP4, buffer);
 
                 if (retcode == 0)
                 {
-                    retcode = r4s.Rockey(3, ref handle, ref lp1, ref lp2, ref p1, ref p2, ref p3, ref p4, buffer);
+                    retcode = r4s.Rockey(RY_OPEN, ref handle, ref lp1, ref lp2, ref p1, ref p2, ref p3, ref p4, buffer);
 
                     if (retcode == 0)
                     {
                         lblDongleStatus.Text = "Connected ✓";
                         lblDongleStatus.ForeColor = System.Drawing.Color.Green;
                         lblHandle.Text = $"0x{handle:X4}";
-                        r4s.Rockey(4, ref handle, ref lp1, ref lp2, ref p1, ref p2, ref p3, ref p4, buffer);
+                        r4s.Rockey(RY_CLOSE, ref handle, ref lp1, ref lp2, ref p1, ref p2, ref p3, ref p4, buffer);
                     }
                     else
                     {
@@ -460,65 +611,19 @@ namespace RockeyPasswordTester
             }
         }
 
-        private HashSet<string> LoadTestedSeeds(string logFilePath)
+        private ResumeInfo LoadResumeInfo(string logFilePath)
         {
-            var testedSeeds = new HashSet<string>();
+            var resumeInfo = new ResumeInfo();
 
             if (File.Exists(logFilePath))
             {
                 try
                 {
-                    using (var reader = new StreamReader(logFilePath))
+                    List<string> fields = ParseCsvLine(ReadLastNonEmptyLine(logFilePath));
+                    string seed = fields.Count > 0 ? fields[0] : string.Empty;
+                    if (!string.IsNullOrEmpty(seed) && !seed.Equals("Seed", StringComparison.OrdinalIgnoreCase))
                     {
-                        string line;
-                        bool headerSkipped = false;
-
-                        while ((line = reader.ReadLine()) != null)
-                        {
-                            if (!headerSkipped)
-                            {
-                                headerSkipped = true;
-                                continue;
-                            }
-
-                            int commaIndex = line.IndexOf(',');
-                            if (commaIndex > 0)
-                            {
-                                string seed = line.Substring(0, commaIndex).Trim('"');
-                                if (!string.IsNullOrEmpty(seed))
-                                {
-                                    testedSeeds.Add(seed);
-                                }
-                            }
-                        }
-                    }
-
-                    if (testedSeeds.Count > 0)
-                    {
-                        using (var reader = new StreamReader(logFilePath))
-                        {
-                            string line;
-                            bool headerSkipped = false;
-
-                            while ((line = reader.ReadLine()) != null)
-                            {
-                                if (!headerSkipped)
-                                {
-                                    headerSkipped = true;
-                                    continue;
-                                }
-
-                                int commaIndex = line.IndexOf(',');
-                                if (commaIndex > 0)
-                                {
-                                    string seed = line.Substring(0, commaIndex).Trim('"');
-                                    if (!string.IsNullOrEmpty(seed))
-                                    {
-                                        _lastTestedSeed = seed;
-                                    }
-                                }
-                            }
-                        }
+                        resumeInfo.LastSeed = seed;
                     }
                 }
                 catch (Exception ex)
@@ -528,7 +633,92 @@ namespace RockeyPasswordTester
                 }
             }
 
-            return testedSeeds;
+            return resumeInfo;
+        }
+
+        private string ReadLastNonEmptyLine(string filePath)
+        {
+            const int BufferSize = 8192;
+
+            using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                if (stream.Length == 0)
+                    return string.Empty;
+
+                var lineBytes = new List<byte>();
+                var buffer = new byte[BufferSize];
+                long position = stream.Length;
+                bool foundContent = false;
+
+                while (position > 0)
+                {
+                    int bytesToRead = (int)Math.Min(BufferSize, position);
+                    position -= bytesToRead;
+                    stream.Seek(position, SeekOrigin.Begin);
+                    int bytesRead = stream.Read(buffer, 0, bytesToRead);
+
+                    for (int i = bytesRead - 1; i >= 0; i--)
+                    {
+                        byte current = buffer[i];
+                        if (current == '\n' || current == '\r')
+                        {
+                            if (foundContent)
+                            {
+                                lineBytes.Reverse();
+                                return Encoding.UTF8.GetString(lineBytes.ToArray()).Trim();
+                            }
+
+                            continue;
+                        }
+
+                        foundContent = true;
+                        lineBytes.Add(current);
+                    }
+                }
+
+                lineBytes.Reverse();
+                return Encoding.UTF8.GetString(lineBytes.ToArray()).Trim();
+            }
+        }
+
+        private List<string> ParseCsvLine(string line)
+        {
+            var fields = new List<string>();
+            if (string.IsNullOrWhiteSpace(line))
+                return fields;
+
+            var field = new StringBuilder();
+            bool inQuotes = false;
+
+            for (int i = 0; i < line.Length; i++)
+            {
+                char current = line[i];
+
+                if (current == '"')
+                {
+                    if (inQuotes && i + 1 < line.Length && line[i + 1] == '"')
+                    {
+                        field.Append('"');
+                        i++;
+                        continue;
+                    }
+
+                    inQuotes = !inQuotes;
+                    continue;
+                }
+
+                if (current == ',' && !inQuotes)
+                {
+                    fields.Add(field.ToString().Trim());
+                    field.Clear();
+                    continue;
+                }
+
+                field.Append(current);
+            }
+
+            fields.Add(field.ToString().Trim());
+            return fields;
         }
 
         private async System.Threading.Tasks.Task<List<string>> LoadSeedsAsync(string filePath)
@@ -561,11 +751,18 @@ namespace RockeyPasswordTester
             });
         }
 
-        private IEnumerable<string> GenerateCombinations(string charset, int length, long? limit = null)
+        private IEnumerable<string> GenerateCombinations(string charset, int length, long? limit = null, long startIndex = 0)
         {
             var indices = new int[length];
             var charsetArray = charset.ToCharArray();
-            long count = 0;
+            long count = Math.Max(0, startIndex);
+            long workingIndex = count;
+
+            for (int i = length - 1; i >= 0; i--)
+            {
+                indices[i] = (int)(workingIndex % charsetArray.Length);
+                workingIndex /= charsetArray.Length;
+            }
 
             while (true)
             {
@@ -592,21 +789,53 @@ namespace RockeyPasswordTester
             }
         }
 
-        private async System.Threading.Tasks.Task TestSeedsAsync(List<string> seeds, Rockey4SmartClass.Rockey4Smart r4s, ushort handle, ushort initialP1, ushort initialP2, ushort initialP3, ushort initialP4, string targetPassword, CancellationToken cancellationToken)
+        private bool TryGetCombinationIndex(string seed, string charset, int length, out long index)
         {
-            int tested = 0;
-            int generated = 0;
-            int verified = 0;
+            index = 0;
+
+            if (seed.Length != length || string.IsNullOrEmpty(charset))
+                return false;
+
+            var charIndexes = new Dictionary<char, int>();
+            for (int i = 0; i < charset.Length; i++)
+            {
+                if (!charIndexes.ContainsKey(charset[i]))
+                {
+                    charIndexes.Add(charset[i], i);
+                }
+            }
+
+            for (int i = 0; i < seed.Length; i++)
+            {
+                if (!charIndexes.TryGetValue(seed[i], out int charIndex))
+                    return false;
+
+                checked
+                {
+                    index = (index * charset.Length) + charIndex;
+                }
+            }
+
+            return true;
+        }
+
+        private void TestSeeds(List<string> seeds, Rockey4SmartClass.Rockey4Smart r4s, ushort handle, ushort initialP1, ushort initialP2, ushort initialP3, ushort initialP4, string targetPassword, CancellationToken cancellationToken)
+        {
+            long tested = 0;
+            long generated = 0;
+            long verified = 0;
 
             uint lp1 = 0;
             uint lp2 = 0;
-            ushort p1 = initialP1;
-            ushort p2 = initialP2;
-            ushort p3 = initialP3;
-            ushort p4 = initialP4;
+            ushort currentP1 = initialP1;
+            ushort currentP2 = initialP2;
+            ushort currentP3 = initialP3;
+            ushort currentP4 = initialP4;
             byte[] buffer = new byte[1024];
 
             bool headerWritten = false;
+            int yieldInterval = _speedMode == SpeedMode.Fast ? 50 : _speedMode == SpeedMode.Balanced ? 100 : 200;
+            int consecutiveSeedErrors = 0;
 
             foreach (string seed in seeds)
             {
@@ -617,17 +846,25 @@ namespace RockeyPasswordTester
                 {
                     if (cancellationToken.IsCancellationRequested)
                         break;
-                    await Task.Delay(50, cancellationToken);
+                    cancellationToken.WaitHandle.WaitOne(50);
                 }
 
                 try
                 {
-                    uint seedValue = ConvertSeedToUint(seed);
+                    if (!TryConvertSeedToUint(seed, out uint seedValue))
+                    {
+                        throw new FormatException($"Seed '{seed}' is not an 8-character hexadecimal 32-bit value.");
+                    }
 
                     lp2 = seedValue;
                     lp1 = 0;
+                    Array.Clear(buffer, 0, buffer.Length);
+                    ushort p1 = currentP1;
+                    ushort p2 = currentP2;
+                    ushort p3 = currentP3;
+                    ushort p4 = currentP4;
 
-                    ushort retcode = r4s.Rockey(8, ref handle, ref lp1, ref lp2, ref p1, ref p2, ref p3, ref p4, buffer);
+                    ushort retcode = r4s.Rockey(RY_SEED, ref handle, ref lp1, ref lp2, ref p1, ref p2, ref p3, ref p4, buffer);
 
                     string passwordStr = "ERROR";
                     string status = "ERROR";
@@ -639,7 +876,13 @@ namespace RockeyPasswordTester
                         status = "SUCCESS";
                         generated++;
                         verifiedOK = true;
+                        verified++;
                         _lastTestedSeed = seed;
+                        currentP1 = p1;
+                        currentP2 = p2;
+                        currentP3 = p3;
+                        currentP4 = p4;
+                        consecutiveSeedErrors = 0;
 
                         if (!string.IsNullOrEmpty(targetPassword) && passwordStr.Equals(targetPassword, StringComparison.OrdinalIgnoreCase))
                         {
@@ -661,22 +904,32 @@ namespace RockeyPasswordTester
                     else
                     {
                         status = $"ERROR_{retcode}";
+                        consecutiveSeedErrors++;
                     }
 
                     LogResult(seed, passwordStr, p1, p2, p3, p4, status, verifiedOK, ref headerWritten);
 
+                    if (consecutiveSeedErrors >= MAX_CONSECUTIVE_SEED_ERRORS)
+                    {
+                        throw new InvalidOperationException($"RY_SEED failed {MAX_CONSECUTIVE_SEED_ERRORS} times in a row. Last error code: {retcode}. Testing stopped to avoid filling the log with invalid results.");
+                    }
+
                     tested++;
 
                     // Update UI counter variables (timer will handle actual UI updates)
-                    _uiTested = tested;
-                    _uiGenerated = generated;
-                    _uiVerified = verified;
+                    Interlocked.Exchange(ref _uiTested, tested);
+                    Interlocked.Exchange(ref _uiGenerated, generated);
+                    Interlocked.Exchange(ref _uiVerified, verified);
 
-                    // Periodically yield to keep UI responsive in fast mode
-                    if ((_speedMode == SpeedMode.Fast || _speedMode == SpeedMode.Balanced) && tested % 1000 == 0)
+                    // Periodically yield to keep UI responsive
+                    if (tested % yieldInterval == 0)
                     {
-                        await Task.Yield();
+                        Thread.Sleep(1);
                     }
+                }
+                catch (InvalidOperationException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -690,26 +943,27 @@ namespace RockeyPasswordTester
             _verifiedPasswords = verified;
         }
 
-        private async System.Threading.Tasks.Task TestCombinationsAsync(string charset, int length, long? limit, HashSet<string> testedSeeds, Rockey4SmartClass.Rockey4Smart r4s, ushort handle, ushort initialP1, ushort initialP2, ushort initialP3, ushort initialP4, string targetPassword, CancellationToken cancellationToken)
+        private void TestCombinations(string charset, int length, long? limit, long startIndex, Rockey4SmartClass.Rockey4Smart r4s, ushort handle, ushort initialP1, ushort initialP2, ushort initialP3, ushort initialP4, string targetPassword, CancellationToken cancellationToken)
         {
-            int tested = 0;
-            int generated = 0;
-            int verified = 0;
-            int skipped = testedSeeds.Count;
+            long tested = 0;
+            long generated = 0;
+            long verified = 0;
+            long skipped = startIndex;
 
             uint lp1 = 0;
             uint lp2 = 0;
-            ushort p1 = initialP1;
-            ushort p2 = initialP2;
-            ushort p3 = initialP3;
-            ushort p4 = initialP4;
+            ushort currentP1 = initialP1;
+            ushort currentP2 = initialP2;
+            ushort currentP3 = initialP3;
+            ushort currentP4 = initialP4;
             byte[] buffer = new byte[1024];
 
             bool headerWritten = false;
             long total = limit.HasValue ? limit.Value : (long)Math.Pow(charset.Length, length);
-            int yieldInterval = (_speedMode == SpeedMode.Fast) ? 500 : 1000; // More frequent yielding in fast mode
+            int yieldInterval = _speedMode == SpeedMode.Fast ? 50 : _speedMode == SpeedMode.Balanced ? 100 : 200;
+            int consecutiveSeedErrors = 0;
 
-            foreach (string seed in GenerateCombinations(charset, length, limit))
+            foreach (string seed in GenerateCombinations(charset, length, limit, startIndex))
             {
                 if (cancellationToken.IsCancellationRequested)
                     break;
@@ -718,22 +972,25 @@ namespace RockeyPasswordTester
                 {
                     if (cancellationToken.IsCancellationRequested)
                         break;
-                    await Task.Delay(50, cancellationToken);
-                }
-
-                if (testedSeeds.Contains(seed))
-                {
-                    continue;
+                    cancellationToken.WaitHandle.WaitOne(50);
                 }
 
                 try
                 {
-                    uint seedValue = ConvertSeedToUint(seed);
+                    if (!TryConvertSeedToUint(seed, out uint seedValue))
+                    {
+                        throw new FormatException($"Seed '{seed}' is not an 8-character hexadecimal 32-bit value.");
+                    }
 
                     lp2 = seedValue;
                     lp1 = 0;
+                    Array.Clear(buffer, 0, buffer.Length);
+                    ushort p1 = currentP1;
+                    ushort p2 = currentP2;
+                    ushort p3 = currentP3;
+                    ushort p4 = currentP4;
 
-                    ushort retcode = r4s.Rockey(8, ref handle, ref lp1, ref lp2, ref p1, ref p2, ref p3, ref p4, buffer);
+                    ushort retcode = r4s.Rockey(RY_SEED, ref handle, ref lp1, ref lp2, ref p1, ref p2, ref p3, ref p4, buffer);
 
                     string passwordStr = "ERROR";
                     string status = "ERROR";
@@ -745,7 +1002,13 @@ namespace RockeyPasswordTester
                         status = "SUCCESS";
                         generated++;
                         verifiedOK = true;
+                        verified++;
                         _lastTestedSeed = seed;
+                        currentP1 = p1;
+                        currentP2 = p2;
+                        currentP3 = p3;
+                        currentP4 = p4;
+                        consecutiveSeedErrors = 0;
 
                         if (!string.IsNullOrEmpty(targetPassword) && passwordStr.Equals(targetPassword, StringComparison.OrdinalIgnoreCase))
                         {
@@ -767,22 +1030,32 @@ namespace RockeyPasswordTester
                     else
                     {
                         status = $"ERROR_{retcode}";
+                        consecutiveSeedErrors++;
                     }
 
                     LogResult(seed, passwordStr, p1, p2, p3, p4, status, verifiedOK, ref headerWritten);
 
+                    if (consecutiveSeedErrors >= MAX_CONSECUTIVE_SEED_ERRORS)
+                    {
+                        throw new InvalidOperationException($"RY_SEED failed {MAX_CONSECUTIVE_SEED_ERRORS} times in a row. Last error code: {retcode}. Testing stopped to avoid filling the log with invalid results.");
+                    }
+
                     tested++;
 
                     // Update UI counter variables (timer will handle actual UI updates)
-                    _uiTested = tested;
-                    _uiGenerated = generated;
-                    _uiVerified = verified;
+                    Interlocked.Exchange(ref _uiTested, tested);
+                    Interlocked.Exchange(ref _uiGenerated, generated);
+                    Interlocked.Exchange(ref _uiVerified, verified);
 
                     // Periodically yield to keep UI responsive - more aggressive in fast mode
                     if (tested % yieldInterval == 0)
                     {
-                        await Task.Yield();
+                        Thread.Sleep(1);
                     }
+                }
+                catch (InvalidOperationException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -798,20 +1071,23 @@ namespace RockeyPasswordTester
 
         private void LogResult(string seed, string passwordStr, ushort p1, ushort p2, ushort p3, ushort p4, string status, bool verifiedOK, ref bool headerWritten)
         {
-            string[] words = passwordStr.Split(' ');
-            string word1 = words.Length > 0 ? words[0] : "N/A";
-            string word2 = words.Length > 1 ? words[1] : "N/A";
-            string word3 = words.Length > 2 ? words[2] : "N/A";
-            string word4 = words.Length > 3 ? words[3] : "N/A";
+            string word1 = verifiedOK ? $"{p1:X4}" : "N/A";
+            string word2 = verifiedOK ? $"{p2:X4}" : "N/A";
+            string word3 = verifiedOK ? $"{p3:X4}" : "N/A";
+            string word4 = verifiedOK ? $"{p4:X4}" : "N/A";
             string verifiedStr = verifiedOK ? "YES" : "NO";
 
             string logLine = $"\"{seed}\",\"{passwordStr}\",{word1},{word2},{word3},{word4},{status},{verifiedStr},{DateTime.Now:yyyy-MM-dd HH:mm:ss}";
 
-            _logBuffer.AppendLine(logLine);
-
-            if (_logBuffer.Length > LOG_BUFFER_SIZE * 100)
+            lock (_logLock)
             {
-                FlushLogBuffer();
+                _logBuffer.AppendLine(logLine);
+                _logBufferedLines++;
+
+                if (!_hasFlushedFirstLogLine || _logBufferedLines >= LOG_FLUSH_LINE_COUNT || _logBuffer.Length > LOG_BUFFER_SIZE * 100)
+                {
+                    FlushLogBuffer();
+                }
             }
         }
 
@@ -819,7 +1095,16 @@ namespace RockeyPasswordTester
         {
             string logLine = $"\"{seed}\",\"EXCEPTION\",N/A,N/A,N/A,N/A,EXCEPTION,NO,{DateTime.Now:yyyy-MM-dd HH:mm:ss}";
 
-            _logBuffer.AppendLine(logLine);
+            lock (_logLock)
+            {
+                _logBuffer.AppendLine(logLine);
+                _logBufferedLines++;
+
+                if (!_hasFlushedFirstLogLine || _logBufferedLines >= LOG_FLUSH_LINE_COUNT)
+                {
+                    FlushLogBuffer();
+                }
+            }
 
             // In brute-force fast mode, skip UI updates entirely to maintain performance
             if (_testMode == TestMode.BruteForce && _speedMode == SpeedMode.Fast)
@@ -842,18 +1127,23 @@ namespace RockeyPasswordTester
 
         private void FlushLogBuffer()
         {
-            if (_logBuffer.Length > 0 && _logWriter != null)
+            lock (_logLock)
             {
-                try
+                if (_logBuffer.Length > 0 && _logWriter != null)
                 {
-                    _logWriter.Write(_logBuffer.ToString());
-                    _logWriter.Flush();
-                    _logBuffer.Clear();
-                }
-                catch (Exception ex)
-                {
-                    MessageBox.Show($"Error writing to log file: {ex.Message}", "Error",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    try
+                    {
+                        _logWriter.Write(_logBuffer.ToString());
+                        _logWriter.Flush();
+                        _logBuffer.Clear();
+                        _logBufferedLines = 0;
+                        _hasFlushedFirstLogLine = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show($"Error writing to log file: {ex.Message}", "Error",
+                            MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
                 }
             }
         }
@@ -884,19 +1174,29 @@ namespace RockeyPasswordTester
             });
         }
 
-        private uint ConvertSeedToUint(string seed)
+        private bool TryConvertSeedToUint(string seed, out uint seedValue)
         {
-            if (seed.Length == 8 && uint.TryParse(seed, System.Globalization.NumberStyles.HexNumber, null, out uint parsedValue))
+            seedValue = 0;
+
+            if (seed.Length != 8)
             {
-                return parsedValue;
+                return false;
             }
 
-            byte[] seedBytes = Encoding.GetEncoding("ISO-8859-1").GetBytes(seed);
-            if (seedBytes.Length < 4)
+            for (int i = 0; i < seed.Length; i++)
             {
-                Array.Resize(ref seedBytes, 4);
+                char c = seed[i];
+                bool isHex = (c >= '0' && c <= '9')
+                    || (c >= 'A' && c <= 'F')
+                    || (c >= 'a' && c <= 'f');
+
+                if (!isHex)
+                {
+                    return false;
+                }
             }
-            return BitConverter.ToUInt32(seedBytes, 0);
+
+            return uint.TryParse(seed, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out seedValue);
         }
 
         private string PadRight(string str, int length)

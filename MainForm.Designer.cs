@@ -467,7 +467,7 @@ namespace RockeyPasswordTester
             // 
             nudLimit.Location = new System.Drawing.Point(128, 60);
             nudLimit.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
-            nudLimit.Maximum = new decimal(new int[] { int.MaxValue, 0, 0, 0 });
+            nudLimit.Maximum = new decimal(new int[] { 0, 1, 0, 0 });
             nudLimit.Name = "nudLimit";
             nudLimit.Size = new System.Drawing.Size(117, 23);
             nudLimit.TabIndex = 0;
