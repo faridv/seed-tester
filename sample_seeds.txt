@@ -1,0 +1,70 @@
+# Sample seeds for Rockey4 Smart password generation
+# Each seed is 8 hex characters (0-9, A-F)
+# These represent the 32-bit DWORD (lp2) parameter
+
+# Common hex patterns
+12345678
+87654321
+ABCDEF00
+FEDCBA01
+00000001
+FFFFFFFF
+DEADBEEF
+CAFEBABE
+BADC0FFE
+FEEDFACE
+
+# Sequential patterns
+00000000
+00000002
+00000004
+00000008
+00000010
+00000020
+00000040
+00000080
+
+# Alternating patterns
+AAAA5555
+5555AAAA
+FF00FF00
+00FF00FF
+A5A5A5A5
+5A5A5A5A
+
+# Windows-style hex
+00400000
+00410000
+7FFE0000
+
+# Random-looking patterns
+1234ABCD
+DCBA4321
+98765432
+23456789
+ABCDEF12
+21FEDCBA
+1A2B3C4D
+4D3C2B1A
+
+# Power of 2 boundaries
+00010000
+00020000
+00040000
+00080000
+00100000
+00200000
+00400000
+00800000
+
+# Test patterns
+AAAAAAAA
+BBBBBBBB
+CCCCCCCC
+DDDDDDDD
+EEEEEEEE
+FFFFFFFF
+
+# Mixed case (uppercase recommended)
+abcdef12
+12fedcba
