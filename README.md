@@ -44,7 +44,7 @@ A C# Windows Forms application that tests a list of seeds against a **Rockey4 Sm
 - Each test generates a **new password**
 - All passwords are logged to CSV
 - You can use any generated password from the log
-- Same seed will generate different passwords over time
+- Same seed will generate same passwords with any dongle
 
 ## Installation
 
@@ -218,9 +218,7 @@ Seed,Password,Word1,Word2,Word3,Word4,Status,Timestamp
 **Checklist**:
 - [ ] Dongle is connected to USB
 - [ ] Rockey4SClass.dll is in the same directory as .exe
-- [ ] Running as Administrator
 - [ ] Different USB port
-- [ ] Dongle driver is installed
 - [ ] Correct dongle type (Rockey4 Smart, not Rockey4ND)
 
 ### "Error code: X"
@@ -230,6 +228,7 @@ Seed,Password,Word1,Word2,Word3,Word4,Status,Timestamp
 | 1 | Dongle not found | Check USB connection |
 | 2 | Invalid parameters | Verify P1-P4 values |
 | 3 | Dongle in use | Close other applications |
+| 13 | Error in generating seed | unplug and replug dongle |
 | 255 | Communication error | Reconnect dongle |
 
 ### CSV File Empty
@@ -268,7 +267,7 @@ Seed,Password,Word1,Word2,Word3,Word4,Status,Timestamp
 
 ### Data Storage
 
-1. **Seeds**: Stored in plain text in memory
+1. **Seeds**: Stored in plain text in CSV
 2. **Passwords**: Stored in plain text in CSV
 3. **Logs**: Not encrypted
 
@@ -289,55 +288,11 @@ Seed,Password,Word1,Word2,Word3,Word4,Status,Timestamp
    - Document seed → password mappings
    - Never lose documentation
 
-## Example Workflow
-
-### Scenario: Configure 10 New Dongles
-
-1. **Prepare Seed List**:
-   ```
-   dongle1
-   dongle2
-   dongle3
-   dongle4
-   dongle5
-   dongle6
-   dongle7
-   dongle8
-   dongle9
-   dongle10
-   ```
-
-2. **Run Test**:
-   - Load seed list
-   - Start testing
-   - Wait for completion
-
-3. **Use Passwords**:
-   - Open `password_log.csv`
-   - Find each dongle's password
-   - Configure dongles
-   - Document which password used for which dongle
-
-4. **Secure Documentation**:
-   - Save CSV securely
-   - Document mappings
-   - Never lose this information!
-
-## Comparison: Rockey4ND vs Rockey4 Smart
-
-| Feature | Rockey4ND | Rockey4 Smart |
-|---------|-----------|---------------|
-| DLL | Rockey4ND.dll | **Rockey4SClass.dll** |
-| API | Rockey36 | **Rockey** |
-| Parameters | 8 parameters | **6 parameters** |
-| Password Behavior | Deterministic | **Changes each time** |
-
 ## Limitations
 
 1. **Dongle Required**: Must have physical dongle
-2. **Speed Limited**: USB communication bottleneck
-3. **Password Changes**: Each test generates new password
-4. **No Reversal**: Cannot recover seed from password
+2. **Speed Limited**: USB communication bottleneck (~400 seeds/sec)
+3. **No Reversal**: Cannot recover seed from password
 
 ## Best Practices
 
