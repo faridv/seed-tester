@@ -30,7 +30,9 @@ namespace RockeyPasswordTester
         private const ushort RY_OPEN = 3;
         private const ushort RY_CLOSE = 4;
         private const ushort RY_SEED = 8;
-        private const int MAX_CONSECUTIVE_SEED_ERRORS = 10;
+        private const int MAX_CONSECUTIVE_SEED_ERRORS = 3;
+        private const string ROCKEY_DONGLE_NAME = "ROCKEY4";
+        private const int USB_RESET_RETRY_DELAY_MS = 8000;
 
         private CancellationTokenSource? _cancellationTokenSource;
         private StreamWriter? _logWriter;
@@ -410,9 +412,47 @@ namespace RockeyPasswordTester
             {
                 _sw.Stop();
                 _uiTimer.Stop();
-                MessageBox.Show(ex.Message, "Testing stopped",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                lblStatus.Text = "Testing stopped.";
+
+                string errorTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+
+                if (ex.Message.Contains("Automatic restart will be attempted"))
+                {
+                    // Dongle recovery failed - physical reset required
+                    this.Invoke((MethodInvoker)delegate
+                    {
+                        txtResults.AppendText($"\r\n✗ [{errorTime}] Software reset failed. Physical dongle reset required.\r\n");
+                        txtResults.AppendText($"   Please disconnect and reconnect the USB dongle, then click Start.\r\n");
+                        txtResults.AppendText($"   The test will resume from: {_lastTestedSeed}\r\n");
+                        txtResults.ScrollToCaret();
+                        lblStatus.Text = "Waiting for manual dongle reconnection...";
+                    });
+                }
+                else if (ex.Message.Contains("RY_SEED failed"))
+                {
+                    // RY_SEED errors detected - trigger recovery
+                    this.Invoke((MethodInvoker)delegate
+                    {
+                        txtResults.AppendText($"\r\n✗ [{errorTime}] Dongle command failures detected. Initiating recovery...\r\n");
+                        txtResults.ScrollToCaret();
+                        lblStatus.Text = "Attempting recovery...";
+                    });
+
+                    // Attempt restart
+                    this.Invoke((MethodInvoker)delegate
+                    {
+                        btnTest_Click(null, null);
+                    });
+                }
+                else
+                {
+                    // Other unrecoverable error
+                    this.Invoke((MethodInvoker)delegate
+                    {
+                        txtResults.AppendText($"\r\n✗ [{errorTime}] Testing stopped: {ex.Message}\r\n");
+                        txtResults.ScrollToCaret();
+                        lblStatus.Text = "Testing stopped - manual intervention required.";
+                    });
+                }
             }
             catch (Exception ex)
             {
@@ -499,58 +539,259 @@ namespace RockeyPasswordTester
 
         private void RunWithOpenDongle(ushort p1, ushort p2, ushort p3, ushort p4, DongleOperation operation, CancellationToken cancellationToken)
         {
-            Rockey4SmartClass.Rockey4Smart r4s = new Rockey4SmartClass.Rockey4Smart();
-            ushort handle = 0;
-            uint lp1 = 0;
-            uint lp2 = 0;
-            byte[] buffer = new byte[1024];
-            bool opened = false;
+            const int MAX_DONGLE_RETRY_ATTEMPTS = 2;
+            const int FIND_RETRY_ATTEMPTS = 5;
+            int retryAttempt = 0;
 
-            ushort openP1 = p1;
-            ushort openP2 = p2;
-            ushort openP3 = p3;
-            ushort openP4 = p4;
-
-            try
+            while (retryAttempt < MAX_DONGLE_RETRY_ATTEMPTS)
             {
-                ushort retcode = r4s.Rockey(RY_FIND, ref handle, ref lp1, ref lp2, ref openP1, ref openP2, ref openP3, ref openP4, buffer);
-                if (retcode != 0)
-                {
-                    throw new InvalidOperationException($"ROCKEY not found. RY_FIND returned error code {retcode}.");
-                }
+                Rockey4SmartClass.Rockey4Smart r4s = new Rockey4SmartClass.Rockey4Smart();
+                ushort handle = 0;
+                uint lp1 = 0;
+                uint lp2 = 0;
+                byte[] buffer = new byte[1024];
+                bool opened = false;
 
-                openP1 = p1;
-                openP2 = p2;
-                openP3 = p3;
-                openP4 = p4;
-                retcode = r4s.Rockey(RY_OPEN, ref handle, ref lp1, ref lp2, ref openP1, ref openP2, ref openP3, ref openP4, buffer);
-                if (retcode != 0)
+                try
                 {
-                    throw new InvalidOperationException($"Failed to open dongle. RY_OPEN returned error code {retcode}.");
-                }
+                    ushort openP1 = p1;
+                    ushort openP2 = p2;
+                    ushort openP3 = p3;
+                    ushort openP4 = p4;
 
-                opened = true;
-                BeginInvoke((MethodInvoker)delegate
-                {
-                    lblDongleStatus.Text = "Connected ✓";
-                    lblDongleStatus.ForeColor = System.Drawing.Color.Green;
-                    lblHandle.Text = $"0x{handle:X4}";
-                });
+                    // Retry finding device multiple times
+                    ushort retcode = 1;
+                    for (int findAttempt = 0; findAttempt < FIND_RETRY_ATTEMPTS; findAttempt++)
+                    {
+                        retcode = r4s.Rockey(RY_FIND, ref handle, ref lp1, ref lp2, ref openP1, ref openP2, ref openP3, ref openP4, buffer);
+                        if (retcode == 0) break;
 
-                operation(r4s, handle, openP1, openP2, openP3, openP4, cancellationToken);
-            }
-            finally
-            {
-                if (opened)
-                {
-                    r4s.Rockey(RY_CLOSE, ref handle, ref lp1, ref lp2, ref openP1, ref openP2, ref openP3, ref openP4, buffer);
+                        if (findAttempt < FIND_RETRY_ATTEMPTS - 1)
+                        {
+                            string logMsg = $"   RY_FIND attempt {findAttempt + 1}/{FIND_RETRY_ATTEMPTS} failed (code {retcode}). Retrying...";
+                            BeginInvoke((MethodInvoker)delegate
+                            {
+                                txtResults.AppendText($"{logMsg}\r\n");
+                                txtResults.ScrollToCaret();
+                            });
+                            Thread.Sleep(1000); // Wait 1 second between find attempts
+                        }
+                    }
+
+                    if (retcode != 0)
+                    {
+                        throw new InvalidOperationException($"ROCKEY not found after {FIND_RETRY_ATTEMPTS} attempts. Last error code: {retcode}");
+                    }
+
+                    openP1 = p1;
+                    openP2 = p2;
+                    openP3 = p3;
+                    openP4 = p4;
+                    retcode = r4s.Rockey(RY_OPEN, ref handle, ref lp1, ref lp2, ref openP1, ref openP2, ref openP3, ref openP4, buffer);
+                    if (retcode != 0)
+                    {
+                        throw new InvalidOperationException($"Failed to open dongle. RY_OPEN returned error code {retcode}.");
+                    }
+
+                    opened = true;
                     BeginInvoke((MethodInvoker)delegate
                     {
-                        lblDongleStatus.Text = "Closed";
-                        lblDongleStatus.ForeColor = System.Drawing.Color.Gray;
-                        lblHandle.Text = "Closed";
+                        lblDongleStatus.Text = "Connected ✓";
+                        lblDongleStatus.ForeColor = System.Drawing.Color.Green;
+                        lblHandle.Text = $"0x{handle:X4}";
                     });
+
+                    operation(r4s, handle, openP1, openP2, openP3, openP4, cancellationToken);
+                    return; // Success - exit retry loop
                 }
+                catch (InvalidOperationException ex) when (retryAttempt < MAX_DONGLE_RETRY_ATTEMPTS - 1)
+                {
+                    // Dongle error - attempt recovery
+                    string errorTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                    string errorMessage = $"✗ [{errorTime}] Dongle error: {ex.Message}";
+
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        txtResults.AppendText($"{errorMessage}\r\n");
+                        txtResults.AppendText($"   Attempting automatic dongle reset (attempt {retryAttempt + 1}/{MAX_DONGLE_RETRY_ATTEMPTS})...\r\n");
+                        txtResults.ScrollToCaret();
+                    });
+
+                    // Reset dongle synchronously with longer wait
+                    Task resetTask = Task.Run(async () =>
+                    {
+                        bool resetSuccess = await ResetUsbDongleAsync();
+
+                        if (resetSuccess)
+                        {
+                            string recoveryTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                            BeginInvoke((MethodInvoker)delegate
+                            {
+                                txtResults.AppendText($"✓ [{recoveryTime}] Dongle reset successful. Waiting for re-initialization...\r\n");
+                                txtResults.ScrollToCaret();
+                            });
+                        }
+                    });
+
+                    if (!resetTask.Wait(15000))
+                    {
+                        resetTask.Wait(); // Wait indefinitely if needed
+                    }
+
+                    // Additional wait to ensure dongle is fully re-initialized
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        txtResults.AppendText($"   Waiting {USB_RESET_RETRY_DELAY_MS / 1000} seconds for dongle to re-initialize...\r\n");
+                    });
+                    Thread.Sleep(USB_RESET_RETRY_DELAY_MS);
+
+                    retryAttempt++;
+                }
+                finally
+                {
+                    if (opened)
+                    {
+                        try
+                        {
+                            ushort closeHandle = handle;
+                            uint closeLp1 = 0;
+                            uint closeLp2 = 0;
+                            ushort closeP1 = p1;
+                            ushort closeP2 = p2;
+                            ushort closeP3 = p3;
+                            ushort closeP4 = p4;
+                            r4s.Rockey(RY_CLOSE, ref closeHandle, ref closeLp1, ref closeLp2, ref closeP1, ref closeP2, ref closeP3, ref closeP4, buffer);
+                        }
+                        catch { }
+
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            lblDongleStatus.Text = "Closed";
+                            lblDongleStatus.ForeColor = System.Drawing.Color.Gray;
+                            lblHandle.Text = "Closed";
+                        });
+                    }
+                }
+            }
+
+            // If we exhausted all retries, throw exception to trigger automatic test restart
+            throw new InvalidOperationException("Dongle failed to recover after multiple reset attempts. Automatic restart will be attempted.");
+        }
+
+        private async Task<bool> ResetUsbDongleAsync()
+        {
+            try
+            {
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    txtResults.AppendText($"   Performing physical USB disconnect/reconnect...\r\n");
+                    lblStatus.Text = "Resetting USB port...";
+                });
+
+                // Strategy: Find the USB hub that the device is connected to and reset it
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = $@"-NoProfile -Command ""
+try {{
+    # Find the ROCKEY device
+    $device = Get-PnpDevice -FriendlyName '{ROCKEY_DONGLE_NAME}' -ErrorAction Stop
+
+    if (-not $device) {{
+        Write-Host 'Device not found'
+        exit 1
+    }}
+
+    # Get the device ID to find its parent hub
+    $deviceId = $device.InstanceId
+    Write-Host ""Device found: $deviceId""
+
+    # Parse the device ID to get the port number (e.g., USB\VID_XXXX\SN_XXXX -> get the \d+ part)
+    $parentDeviceId = ($deviceId -split '\\')[0]  # Get USB part
+
+    # Get all USB hubs
+    $hubs = Get-PnpDevice -Class USB | Where-Object {{$_.Name -like '*Hub*' -or $_.PNPClass -eq 'USBHub'}}
+
+    # Find the parent hub (usually the first hub in the chain)
+    if ($hubs) {{
+        $hub = $hubs[0]
+        Write-Host ""Found USB Hub: $($hub.Name)""
+
+        # Disable the hub to force disconnect
+        Disable-PnpDevice -InputObject $hub -Confirm:\$false -ErrorAction Stop
+        Start-Sleep -Seconds 1
+
+        # Re-enable the hub to force reconnect
+        Enable-PnpDevice -InputObject $hub -Confirm:\$false -ErrorAction Stop
+        Start-Sleep -Seconds 3
+
+        Write-Host 'USB Hub reset complete'
+        exit 0
+    }} else {{
+        Write-Host 'No USB Hub found'
+        exit 2
+    }}
+}} catch {{
+    Write-Host ""Error: $_""
+    exit 3
+}}
+""",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    Verb = "runas"
+                };
+
+                using (var process = Process.Start(psi))
+                {
+                    bool finished = await Task.Run(() => process.WaitForExit(20000));
+                    if (!finished)
+                    {
+                        process.Kill();
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            txtResults.AppendText($"   ✗ Reset timeout\r\n");
+                        });
+                        return false;
+                    }
+
+                    string output = process.StandardOutput.ReadToEnd();
+                    string error = process.StandardError.ReadToEnd();
+
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (!string.IsNullOrWhiteSpace(output))
+                            txtResults.AppendText($"   {output.Trim()}\r\n");
+                    });
+
+                    if (process.ExitCode == 0)
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            txtResults.AppendText($"   ✓ Physical USB reset successful! (You should hear USB disconnect/reconnect sounds)\r\n");
+                        });
+                        return true;
+                    }
+                    else
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            txtResults.AppendText($"   ✗ Reset failed with code {process.ExitCode}\r\n");
+                            if (!string.IsNullOrWhiteSpace(error))
+                                txtResults.AppendText($"   Error: {error.Trim()}\r\n");
+                        });
+                        return false;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    txtResults.AppendText($"   ✗ Reset exception: {ex.Message}\r\n");
+                });
+                return false;
             }
         }
 
