@@ -27,12 +27,28 @@ namespace RockeyPasswordTester
     public partial class MainForm : Form
     {
         private const ushort RY_FIND = 1;
+        private const ushort RY_FIND_NEXT = 2;
         private const ushort RY_OPEN = 3;
         private const ushort RY_CLOSE = 4;
         private const ushort RY_SEED = 8;
         private const int MAX_CONSECUTIVE_SEED_ERRORS = 3;
         private const string ROCKEY_DONGLE_NAME = "ROCKEY4";
+        // Hardware ID of the *physical* Feitian/Rockey4 USB device. The "ROCKEY4" friendly
+        // name belongs to a virtual ROOT\USB node the driver installs; disabling that (or a
+        // random hub, as the old code did) does nothing to power-cycle the real dongle. To
+        // virtually unplug/replug we must disable+enable this device node.
+        private const string ROCKEY_HARDWARE_ID = @"USB\VID_096E&PID_0006";
         private const int USB_RESET_RETRY_DELAY_MS = 8000;
+
+        // 0-based index of the dongle this instance should bind to (RY_FIND then N x RY_FIND_NEXT).
+        // Lets you run one app instance per dongle. Defaults to the first dongle found.
+        private int _selectedDongleIndex = 0;
+        // Exact Windows PnP InstanceId of the physical dongle this instance opened, e.g.
+        // "USB\VID_096E&PID_0006\7&30D00E&0&4". Used to reset ONLY this instance's dongle so a
+        // recovery on one instance does not knock the other instances' dongles offline. When
+        // null, the reset falls back to matching every ROCKEY_HARDWARE_ID device (single-dongle case).
+        private string? _selectedUsbInstanceId = null;
+        private readonly object _dongleSelectionLock = new object();
 
         private CancellationTokenSource? _cancellationTokenSource;
         private StreamWriter? _logWriter;
@@ -74,6 +90,15 @@ namespace RockeyPasswordTester
             ushort p4,
             CancellationToken cancellationToken);
 
+        // Multi-instance controls, built in code (see BuildMultiInstanceUi) so the existing
+        // Designer layout stays untouched.
+        private GroupBox grpMultiInstance = null!;
+        private NumericUpDown nudDongleIndex = null!;
+        private Button btnDetectDongles = null!;
+        private Label lblDongleDetected = null!;
+        private TextBox txtStartSeed = null!;
+        private TextBox txtStopSeed = null!;
+
         public MainForm()
         {
             InitializeComponent();
@@ -81,6 +106,99 @@ namespace RockeyPasswordTester
             _uiTimer.Interval = 1000; // 1 second, adjust as needed
             _uiTimer.Tick += UiTimer_Tick;
             UiTotal = 0; // Initialize to avoid division by zero
+            BuildMultiInstanceUi();
+        }
+
+        // Adds the "Multi-Instance" group (dongle selector + brute-force seed range) below the
+        // existing controls, and moves the Results box down to make room. Done programmatically
+        // to avoid disturbing the generated Designer file.
+        private void BuildMultiInstanceUi()
+        {
+            const int groupTop = 724;   // where grpResults currently sits
+            const int groupHeight = 96;
+            const int shift = groupHeight + 8;
+
+            grpMultiInstance = new GroupBox
+            {
+                Text = "Multi-Instance (select a dongle & seed range for this instance)",
+                Location = new System.Drawing.Point(13, groupTop),
+                Size = new System.Drawing.Size(730, groupHeight),
+                TabStop = false
+            };
+
+            var lblDongleIndex = new Label { Text = "Dongle #:", AutoSize = true, Location = new System.Drawing.Point(8, 27) };
+            nudDongleIndex = new NumericUpDown
+            {
+                Location = new System.Drawing.Point(70, 24),
+                Size = new System.Drawing.Size(50, 23),
+                Minimum = 0,
+                Maximum = 31,
+                Value = 0
+            };
+            var toolTip = new ToolTip();
+            toolTip.SetToolTip(nudDongleIndex, "0-based index of the dongle this instance uses (0 = first found). Run one app instance per dongle.");
+
+            btnDetectDongles = new Button
+            {
+                Text = "Detect Dongles",
+                Location = new System.Drawing.Point(128, 23),
+                Size = new System.Drawing.Size(120, 25)
+            };
+            btnDetectDongles.Click += btnDetectDongles_Click;
+
+            lblDongleDetected = new Label
+            {
+                Text = "Click 'Detect Dongles' to list connected dongles.",
+                AutoSize = false,
+                Location = new System.Drawing.Point(256, 27),
+                Size = new System.Drawing.Size(466, 20),
+                ForeColor = System.Drawing.Color.Gray,
+                AutoEllipsis = true
+            };
+
+            var lblStartSeed = new Label { Text = "Start seed:", AutoSize = true, Location = new System.Drawing.Point(8, 62) };
+            txtStartSeed = new TextBox
+            {
+                Location = new System.Drawing.Point(78, 59),
+                Size = new System.Drawing.Size(90, 23),
+                CharacterCasing = CharacterCasing.Upper,
+                MaxLength = 8
+            };
+            toolTip.SetToolTip(txtStartSeed, "Brute-force only. 8-hex-digit seed to begin at, e.g. 11111111. Leave empty to start at the beginning of the charset range.");
+
+            var lblStopSeed = new Label { Text = "Stop before:", AutoSize = true, Location = new System.Drawing.Point(190, 62) };
+            txtStopSeed = new TextBox
+            {
+                Location = new System.Drawing.Point(268, 59),
+                Size = new System.Drawing.Size(90, 23),
+                CharacterCasing = CharacterCasing.Upper,
+                MaxLength = 8
+            };
+            toolTip.SetToolTip(txtStopSeed, "Brute-force only. Stop when this 8-hex-digit seed is reached (exclusive), e.g. 22222222. Leave empty to run to the end of the range.");
+
+            var lblRangeHint = new Label
+            {
+                Text = "e.g. instance 1: 11111111 → 22222222,  instance 2: 22222222 → 33333333",
+                AutoSize = true,
+                Location = new System.Drawing.Point(372, 62),
+                ForeColor = System.Drawing.Color.Gray
+            };
+
+            grpMultiInstance.Controls.Add(lblDongleIndex);
+            grpMultiInstance.Controls.Add(nudDongleIndex);
+            grpMultiInstance.Controls.Add(btnDetectDongles);
+            grpMultiInstance.Controls.Add(lblDongleDetected);
+            grpMultiInstance.Controls.Add(lblStartSeed);
+            grpMultiInstance.Controls.Add(txtStartSeed);
+            grpMultiInstance.Controls.Add(lblStopSeed);
+            grpMultiInstance.Controls.Add(txtStopSeed);
+            grpMultiInstance.Controls.Add(lblRangeHint);
+
+            Controls.Add(grpMultiInstance);
+
+            // Push the Results group down and grow the form so nothing overlaps.
+            grpResults.Location = new System.Drawing.Point(grpResults.Location.X, groupTop + shift);
+            ClientSize = new System.Drawing.Size(ClientSize.Width, ClientSize.Height + shift);
         }
 
         private long UiTotal
@@ -220,6 +338,12 @@ namespace RockeyPasswordTester
             btnPauseResume.Enabled = true;
             btnPauseResume.Text = "Pause";
             btnClear.Enabled = false;
+            grpMultiInstance.Enabled = false;
+
+            // Bind this run to the selected dongle and work out which physical device to reset if it
+            // wedges. Done here (not only on the Detect button) so the reset targets the right dongle
+            // even if the user never clicked Detect.
+            ResolveSelectedDongle(GetPhysicalDongleInstanceIds(), (int)nudDongleIndex.Value);
 
             txtResults.Clear();
             _seedsTested = 0;
@@ -349,32 +473,63 @@ namespace RockeyPasswordTester
                 {
                     string charset = txtCharset.Text;
                     int length = (int)nudLength.Value;
-                    long? limit = chkLimit.Checked ? (long?)nudLimit.Value : null;
+                    long charsetSpace = (long)Math.Pow(charset.Length, length);
 
-                    long totalCombinations = limit.HasValue ? limit.Value : (long)Math.Pow(charset.Length, length);
-                    long startIndex = 0;
-                    if (isResume)
+                    // Range start for this instance: the explicit "Start seed", else the beginning.
+                    long rangeStart = 0;
+                    string startSeedText = txtStartSeed.Text.Trim();
+                    if (!string.IsNullOrEmpty(startSeedText))
                     {
-                        if (TryGetCombinationIndex(resumeInfo.LastSeed, charset, length, out long lastCombinationIndex) && lastCombinationIndex < totalCombinations)
+                        if (TryGetCombinationIndex(startSeedText, charset, length, out long si))
                         {
-                            startIndex = lastCombinationIndex + 1;
+                            rangeStart = si;
                         }
                         else
                         {
-                            lblStatus.Text = $"Resume seed {resumeInfo.LastSeed} is not in the current brute-force range. Testing from the beginning...";
+                            lblStatus.Text = $"Start seed '{startSeedText}' is invalid for this charset/length ({length} chars). Starting from the beginning...";
                         }
                     }
 
-                    _totalSeedsToTest = Math.Max(0, totalCombinations - startIndex);
+                    // Range end (exclusive): smallest of the full space, the "Stop before" seed, and
+                    // (kept for back-compat) the optional count limit as an absolute index cap.
+                    long rangeStopExclusive = charsetSpace;
+                    string stopSeedText = txtStopSeed.Text.Trim();
+                    if (!string.IsNullOrEmpty(stopSeedText) && TryGetCombinationIndex(stopSeedText, charset, length, out long sp))
+                    {
+                        rangeStopExclusive = Math.Min(rangeStopExclusive, sp);
+                    }
+                    if (chkLimit.Checked)
+                    {
+                        rangeStopExclusive = Math.Min(rangeStopExclusive, (long)nudLimit.Value);
+                    }
+
+                    // Resume advances the start point, but only within this instance's assigned range.
+                    long startIndex = rangeStart;
+                    bool resumedWithinRange = false;
+                    if (isResume && TryGetCombinationIndex(resumeInfo.LastSeed, charset, length, out long lastCombinationIndex))
+                    {
+                        long next = lastCombinationIndex + 1;
+                        if (next > startIndex && next < rangeStopExclusive)
+                        {
+                            startIndex = next;
+                            resumedWithinRange = true;
+                        }
+                    }
+
+                    long? limit = rangeStopExclusive; // GenerateCombinations treats limit as an absolute, exclusive upper bound
+                    _totalSeedsToTest = Math.Max(0, rangeStopExclusive - startIndex);
                     UiTotal = _totalSeedsToTest; // Set total for timer updates
 
-                    if (isResume && startIndex > 0)
+                    string rangeDesc = (startSeedText.Length > 0 || stopSeedText.Length > 0)
+                        ? $" [{(startSeedText.Length > 0 ? startSeedText : "start")} → {(stopSeedText.Length > 0 ? stopSeedText : "end")}]"
+                        : string.Empty;
+                    if (resumedWithinRange)
                     {
-                        lblStatus.Text = $"Resume: Continuing after {resumeInfo.LastSeed}. Testing {_totalSeedsToTest:N0} remaining combinations...";
+                        lblStatus.Text = $"Resume: continuing after {resumeInfo.LastSeed}. Testing {_totalSeedsToTest:N0} combinations{rangeDesc}...";
                     }
                     else
                     {
-                        lblStatus.Text = $"Brute-forcing up to {_totalSeedsToTest:N0} combinations...";
+                        lblStatus.Text = $"Brute-forcing {_totalSeedsToTest:N0} combinations{rangeDesc}...";
                     }
 
                     await RunOnStaThreadAsync(() => RunWithOpenDongle(p1, p2, p3, p4, (r4s, handle, openP1, openP2, openP3, openP4, token) =>
@@ -473,6 +628,7 @@ namespace RockeyPasswordTester
                 btnCancel.Enabled = false;
                 btnPauseResume.Enabled = false;
                 btnClear.Enabled = true;
+                grpMultiInstance.Enabled = true;
                 _cancellationTokenSource?.Dispose();
                 _cancellationTokenSource = null;
             }
@@ -583,6 +739,32 @@ namespace RockeyPasswordTester
                         throw new InvalidOperationException($"ROCKEY not found after {FIND_RETRY_ATTEMPTS} attempts. Last error code: {retcode}");
                     }
 
+                    // Advance to the dongle this instance is bound to. RY_FIND landed on dongle #0;
+                    // step RY_FIND_NEXT to reach the selected index so multiple app instances can
+                    // each drive a different physical dongle.
+                    int dongleIndex;
+                    lock (_dongleSelectionLock) { dongleIndex = _selectedDongleIndex; }
+                    uint selectedHid = lp1;
+                    for (int step = 0; step < dongleIndex; step++)
+                    {
+                        openP1 = p1; openP2 = p2; openP3 = p3; openP4 = p4;
+                        retcode = r4s.Rockey(RY_FIND_NEXT, ref handle, ref lp1, ref lp2, ref openP1, ref openP2, ref openP3, ref openP4, buffer);
+                        if (retcode != 0)
+                        {
+                            throw new InvalidOperationException($"Dongle #{dongleIndex} not found (only {step + 1} dongle(s) present). RY_FIND_NEXT returned error code {retcode}.");
+                        }
+                        selectedHid = lp1;
+                    }
+                    if (dongleIndex > 0)
+                    {
+                        uint hidForLog = selectedHid;
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            txtResults.AppendText($"   Bound to dongle #{dongleIndex} (hardware ID 0x{hidForLog:X8}).\r\n");
+                            txtResults.ScrollToCaret();
+                        });
+                    }
+
                     openP1 = p1;
                     openP2 = p2;
                     openP3 = p3;
@@ -682,73 +864,49 @@ namespace RockeyPasswordTester
         {
             try
             {
+                string? targetInstanceId;
+                lock (_dongleSelectionLock)
+                {
+                    targetInstanceId = _selectedUsbInstanceId;
+                }
+
                 BeginInvoke((MethodInvoker)delegate
                 {
-                    txtResults.AppendText($"   Performing physical USB disconnect/reconnect...\r\n");
-                    lblStatus.Text = "Resetting USB port...";
+                    string what = string.IsNullOrEmpty(targetInstanceId) ? $"all {ROCKEY_HARDWARE_ID} devices" : targetInstanceId;
+                    txtResults.AppendText($"   Virtually unplugging/replugging dongle ({what})...\r\n");
+                    lblStatus.Text = "Resetting USB dongle...";
                 });
 
-                // Strategy: Find the USB hub that the device is connected to and reset it
+                string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(BuildResetScript(targetInstanceId)));
                 var psi = new ProcessStartInfo
                 {
                     FileName = "powershell.exe",
-                    Arguments = $@"-NoProfile -Command ""
-try {{
-    # Find the ROCKEY device
-    $device = Get-PnpDevice -FriendlyName '{ROCKEY_DONGLE_NAME}' -ErrorAction Stop
-
-    if (-not $device) {{
-        Write-Host 'Device not found'
-        exit 1
-    }}
-
-    # Get the device ID to find its parent hub
-    $deviceId = $device.InstanceId
-    Write-Host ""Device found: $deviceId""
-
-    # Parse the device ID to get the port number (e.g., USB\VID_XXXX\SN_XXXX -> get the \d+ part)
-    $parentDeviceId = ($deviceId -split '\\')[0]  # Get USB part
-
-    # Get all USB hubs
-    $hubs = Get-PnpDevice -Class USB | Where-Object {{$_.Name -like '*Hub*' -or $_.PNPClass -eq 'USBHub'}}
-
-    # Find the parent hub (usually the first hub in the chain)
-    if ($hubs) {{
-        $hub = $hubs[0]
-        Write-Host ""Found USB Hub: $($hub.Name)""
-
-        # Disable the hub to force disconnect
-        Disable-PnpDevice -InputObject $hub -Confirm:\$false -ErrorAction Stop
-        Start-Sleep -Seconds 1
-
-        # Re-enable the hub to force reconnect
-        Enable-PnpDevice -InputObject $hub -Confirm:\$false -ErrorAction Stop
-        Start-Sleep -Seconds 3
-
-        Write-Host 'USB Hub reset complete'
-        exit 0
-    }} else {{
-        Write-Host 'No USB Hub found'
-        exit 2
-    }}
-}} catch {{
-    Write-Host ""Error: $_""
-    exit 3
-}}
-""",
+                    Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + encoded,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false,
-                    CreateNoWindow = true,
-                    Verb = "runas"
+                    CreateNoWindow = true
                 };
 
                 using (var process = Process.Start(psi))
                 {
-                    bool finished = await Task.Run(() => process.WaitForExit(20000));
+                    if (process == null)
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            txtResults.AppendText($"   ✗ Could not start reset helper.\r\n");
+                        });
+                        return false;
+                    }
+
+                    // Read output on background threads while waiting, to avoid deadlocking on full pipes.
+                    Task<string> outTask = process.StandardOutput.ReadToEndAsync();
+                    Task<string> errTask = process.StandardError.ReadToEndAsync();
+
+                    bool finished = await Task.Run(() => process.WaitForExit(25000));
                     if (!finished)
                     {
-                        process.Kill();
+                        try { process.Kill(); } catch { }
                         BeginInvoke((MethodInvoker)delegate
                         {
                             txtResults.AppendText($"   ✗ Reset timeout\r\n");
@@ -756,33 +914,39 @@ try {{
                         return false;
                     }
 
-                    string output = process.StandardOutput.ReadToEnd();
-                    string error = process.StandardError.ReadToEnd();
+                    string output = string.Empty;
+                    string error = string.Empty;
+                    try { output = await outTask; } catch { }
+                    try { error = await errTask; } catch { }
+                    int exitCode = process.ExitCode;
+
+                    string outTrim = output.Trim();
+                    string errTrim = error.Trim();
 
                     BeginInvoke((MethodInvoker)delegate
                     {
-                        if (!string.IsNullOrWhiteSpace(output))
-                            txtResults.AppendText($"   {output.Trim()}\r\n");
+                        if (!string.IsNullOrWhiteSpace(outTrim))
+                            txtResults.AppendText($"   {outTrim.Replace("\n", "\r\n   ")}\r\n");
                     });
 
-                    if (process.ExitCode == 0)
+                    if (exitCode == 0)
                     {
                         BeginInvoke((MethodInvoker)delegate
                         {
-                            txtResults.AppendText($"   ✓ Physical USB reset successful! (You should hear USB disconnect/reconnect sounds)\r\n");
+                            txtResults.AppendText($"   ✓ Dongle reset successful (you should hear the USB disconnect/reconnect chime).\r\n");
                         });
                         return true;
                     }
-                    else
+
+                    BeginInvoke((MethodInvoker)delegate
                     {
-                        BeginInvoke((MethodInvoker)delegate
-                        {
-                            txtResults.AppendText($"   ✗ Reset failed with code {process.ExitCode}\r\n");
-                            if (!string.IsNullOrWhiteSpace(error))
-                                txtResults.AppendText($"   Error: {error.Trim()}\r\n");
-                        });
-                        return false;
-                    }
+                        txtResults.AppendText($"   ✗ Reset failed (exit code {exitCode}).\r\n");
+                        if (!string.IsNullOrWhiteSpace(errTrim))
+                            txtResults.AppendText($"   Error: {errTrim}\r\n");
+                        if (exitCode == 1)
+                            txtResults.AppendText($"   The dongle was not found in Device Manager. Is it plugged in?\r\n");
+                    });
+                    return false;
                 }
             }
             catch (Exception ex)
@@ -792,6 +956,201 @@ try {{
                     txtResults.AppendText($"   ✗ Reset exception: {ex.Message}\r\n");
                 });
                 return false;
+            }
+        }
+
+        // Builds the PowerShell script that disables then re-enables the physical dongle device
+        // node - the software equivalent of unplugging and replugging it. Requires the app to run
+        // elevated (see app.manifest); Disable-PnpDevice/Enable-PnpDevice fail without admin.
+        // The script is passed via -EncodedCommand (Base64 UTF-16LE), so no quote/newline escaping
+        // is needed here.
+        private static string BuildResetScript(string? targetInstanceId)
+        {
+            // Selection line: an exact InstanceId for this instance's dongle when known, otherwise
+            // every top-level USB node matching the Rockey hardware id (single-dongle fallback).
+            // Note: the dongle's top-level USB-bus node enumerates under Class HIDClass (it's a HID
+            // device), so we must NOT filter by Class 'USB'. We match on the "USB\VID_096E&PID_0006"
+            // InstanceId prefix, which selects the USB device node (disabling it cascades to the HID
+            // child = a real replug) while excluding the "HID\..." function children.
+            string selection;
+            if (!string.IsNullOrEmpty(targetInstanceId))
+            {
+                selection = "$dev = Get-PnpDevice -InstanceId '" + EscapePsSingleQuoted(targetInstanceId) +
+                            "' -ErrorAction Stop";
+            }
+            else
+            {
+                selection = "$dev = Get-PnpDevice -PresentOnly -ErrorAction Stop | " +
+                            "Where-Object { $_.InstanceId -like '" + EscapePsSingleQuoted(ROCKEY_HARDWARE_ID) + "*' }";
+            }
+
+            // Verbatim (non-interpolated) string: only " needs doubling; braces are literal.
+            string script = @"
+$ErrorActionPreference = 'Stop'
+try {
+    " + selection + @"
+    if (-not $dev) { Write-Host 'ROCKEY dongle not found'; exit 1 }
+    foreach ($d in @($dev)) {
+        Disable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction Stop
+        Write-Host ('Disabled ' + $d.InstanceId)
+    }
+    Start-Sleep -Seconds 2
+    foreach ($d in @($dev)) {
+        Enable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction Stop
+        Write-Host ('Enabled ' + $d.InstanceId)
+    }
+    Start-Sleep -Seconds 2
+    Write-Host 'USB reset complete'
+    exit 0
+} catch {
+    Write-Host ('Error: ' + $_)
+    exit 3
+}";
+
+            return script;
+        }
+
+        private static string EscapePsSingleQuoted(string value)
+        {
+            // In a PowerShell single-quoted string, only the single quote itself needs escaping
+            // (by doubling). Backslashes and & are literal, which is what we want for InstanceIds.
+            return value.Replace("'", "''");
+        }
+
+        // ---- Multi-instance: dongle detection & selection -------------------------------------
+
+        private void GetDongleParams(out ushort p1, out ushort p2, out ushort p3, out ushort p4)
+        {
+            p1 = 0x530A; p2 = 0x00FC; p3 = 0xCB51; p4 = 0x8C4E;
+            if (ushort.TryParse(txtP1.Text, NumberStyles.HexNumber, null, out ushort v1)) p1 = v1;
+            if (ushort.TryParse(txtP2.Text, NumberStyles.HexNumber, null, out ushort v2)) p2 = v2;
+            if (ushort.TryParse(txtP3.Text, NumberStyles.HexNumber, null, out ushort v3)) p3 = v3;
+            if (ushort.TryParse(txtP4.Text, NumberStyles.HexNumber, null, out ushort v4)) p4 = v4;
+        }
+
+        // Enumerates the hardware IDs of every connected dongle via RY_FIND + RY_FIND_NEXT.
+        // Must be called on an STA thread (the native SDK expects it). Best-effort: returns an
+        // empty list on any error.
+        private List<uint> EnumerateSdkDongles(ushort p1, ushort p2, ushort p3, ushort p4)
+        {
+            var ids = new List<uint>();
+            try
+            {
+                var r4s = new Rockey4SmartClass.Rockey4Smart();
+                ushort handle = 0;
+                uint lp1 = 0, lp2 = 0;
+                byte[] buffer = new byte[1024];
+
+                ushort a = p1, b = p2, c = p3, d = p4;
+                ushort rc = r4s.Rockey(RY_FIND, ref handle, ref lp1, ref lp2, ref a, ref b, ref c, ref d, buffer);
+
+                int guard = 0;
+                while (rc == 0 && guard++ < 64)
+                {
+                    ids.Add(lp1); // RY_FIND / RY_FIND_NEXT return the dongle hardware ID in lp1
+                    a = p1; b = p2; c = p3; d = p4; lp1 = 0; lp2 = 0;
+                    rc = r4s.Rockey(RY_FIND_NEXT, ref handle, ref lp1, ref lp2, ref a, ref b, ref c, ref d, buffer);
+                }
+            }
+            catch { /* best effort */ }
+            return ids;
+        }
+
+        // Lists the Windows PnP InstanceIds of the physical Rockey dongles currently present,
+        // sorted for a stable order so a given index maps to the same device across calls.
+        private List<string> GetPhysicalDongleInstanceIds()
+        {
+            var list = new List<string>();
+            try
+            {
+                // Match the USB device node by InstanceId prefix (no -Class filter: the node is
+                // Class HIDClass). The "USB\" prefix excludes the "HID\..." function children.
+                string script =
+                    "Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | " +
+                    "Where-Object { $_.InstanceId -like '" + EscapePsSingleQuoted(ROCKEY_HARDWARE_ID) + "*' } | " +
+                    "Sort-Object InstanceId | Select-Object -ExpandProperty InstanceId";
+                string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + encoded,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                using var p = Process.Start(psi);
+                if (p == null) return list;
+                string outp = p.StandardOutput.ReadToEnd();
+                p.WaitForExit(10000);
+                foreach (var line in outp.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string trimmed = line.Trim();
+                    if (trimmed.Length > 0) list.Add(trimmed);
+                }
+            }
+            catch { /* best effort */ }
+            return list;
+        }
+
+        // Records which dongle index this instance uses and the physical InstanceId to reset for it.
+        // When the index is out of range of the detected physical devices, the reset target is left
+        // null so ResetUsbDongleAsync falls back to the VID/PID match (fine for a single dongle).
+        private void ResolveSelectedDongle(List<string> physicalInstanceIds, int index)
+        {
+            lock (_dongleSelectionLock)
+            {
+                _selectedDongleIndex = index;
+                _selectedUsbInstanceId = (index >= 0 && index < physicalInstanceIds.Count)
+                    ? physicalInstanceIds[index]
+                    : null;
+            }
+        }
+
+        private async void btnDetectDongles_Click(object? sender, EventArgs e)
+        {
+            btnDetectDongles.Enabled = false;
+            lblDongleDetected.ForeColor = System.Drawing.Color.Gray;
+            lblDongleDetected.Text = "Detecting...";
+            try
+            {
+                GetDongleParams(out ushort p1, out ushort p2, out ushort p3, out ushort p4);
+
+                List<uint> hids = new List<uint>();
+                await RunOnStaThreadAsync(() => { hids = EnumerateSdkDongles(p1, p2, p3, p4); });
+                List<string> usb = await Task.Run(() => GetPhysicalDongleInstanceIds());
+
+                int idx = (int)nudDongleIndex.Value;
+                ResolveSelectedDongle(usb, idx);
+
+                string hidStr = hids.Count > 0
+                    ? string.Join(", ", hids.ConvertAll(h => "0x" + h.ToString("X8")))
+                    : "none";
+                string resetTarget = _selectedUsbInstanceId ?? "(all Rockey devices - VID/PID fallback)";
+
+                lblDongleDetected.ForeColor = (hids.Count > 0 || usb.Count > 0)
+                    ? System.Drawing.Color.Black
+                    : System.Drawing.Color.Red;
+                lblDongleDetected.Text =
+                    $"SDK found {hids.Count} dongle(s) [{hidStr}]; Windows sees {usb.Count} USB device(s). " +
+                    $"This instance uses #{idx}; reset target: {resetTarget}";
+
+                if (idx >= Math.Max(hids.Count, usb.Count))
+                {
+                    lblDongleDetected.ForeColor = System.Drawing.Color.DarkOrange;
+                    lblDongleDetected.Text += "  ⚠ index exceeds the number of dongles found.";
+                }
+            }
+            catch (Exception ex)
+            {
+                lblDongleDetected.ForeColor = System.Drawing.Color.Red;
+                lblDongleDetected.Text = "Detect failed: " + ex.Message;
+            }
+            finally
+            {
+                btnDetectDongles.Enabled = true;
             }
         }
 
@@ -1473,3 +1832,4 @@ try {{
         }
     }
 }
+
