@@ -41,14 +41,29 @@ namespace RockeyPasswordTester
         private const int USB_RESET_RETRY_DELAY_MS = 8000;
 
         // 0-based index of the dongle this instance should bind to (RY_FIND then N x RY_FIND_NEXT).
-        // Lets you run one app instance per dongle. Defaults to the first dongle found.
+        // Lets you run one app instance per dongle. Defaults to the first dongle found. Used only as a
+        // fallback when no specific hardware ID was picked (i.e. the user never ran Detect).
         private int _selectedDongleIndex = 0;
+        // SDK hardware ID (from RY_FIND/RY_FIND_NEXT lp1) of the dongle this instance should bind to.
+        // When set, the run walks RY_FIND_NEXT until it hits THIS id, so selection is robust to the
+        // enumeration order rather than a blind index. Null = bind by _selectedDongleIndex instead.
+        private uint? _selectedDongleHid = null;
         // Exact Windows PnP InstanceId of the physical dongle this instance opened, e.g.
         // "USB\VID_096E&PID_0006\7&30D00E&0&4". Used to reset ONLY this instance's dongle so a
         // recovery on one instance does not knock the other instances' dongles offline. When
         // null, the reset falls back to matching every ROCKEY_HARDWARE_ID device (single-dongle case).
         private string? _selectedUsbInstanceId = null;
         private readonly object _dongleSelectionLock = new object();
+
+        // The dongle's parent USB hub chain (immediate hub first, up to and including the root hub),
+        // captured while the dongle is present. When the dongle wedges it drops OFF the USB bus, so
+        // we can't look up its parent then - we power-cycle these remembered hubs instead. Persisted
+        // to dongle-hub.txt next to the exe so it survives restarts.
+        private readonly List<string> _dongleHubChain = new List<string>();
+        // Persisted per dongle index so multiple instances of the same exe (each on its own dongle,
+        // possibly a different hub) don't overwrite each other's saved hub.
+        private static string HubChainFilePath(int dongleIndex) =>
+            Path.Combine(AppContext.BaseDirectory, $"dongle-hub-{dongleIndex}.txt");
 
         private CancellationTokenSource? _cancellationTokenSource;
         private StreamWriter? _logWriter;
@@ -93,11 +108,13 @@ namespace RockeyPasswordTester
         // Multi-instance controls, built in code (see BuildMultiInstanceUi) so the existing
         // Designer layout stays untouched.
         private GroupBox grpMultiInstance = null!;
-        private NumericUpDown nudDongleIndex = null!;
+        private ComboBox cmbDongle = null!;
         private Button btnDetectDongles = null!;
         private Label lblDongleDetected = null!;
         private TextBox txtStartSeed = null!;
         private TextBox txtStopSeed = null!;
+        private Button btnResetL1 = null!;
+        private Button btnResetL2 = null!;
 
         public MainForm()
         {
@@ -107,6 +124,7 @@ namespace RockeyPasswordTester
             _uiTimer.Tick += UiTimer_Tick;
             UiTotal = 0; // Initialize to avoid division by zero
             BuildMultiInstanceUi();
+            LoadHubChain();
         }
 
         // Adds the "Multi-Instance" group (dongle selector + brute-force seed range) below the
@@ -115,7 +133,7 @@ namespace RockeyPasswordTester
         private void BuildMultiInstanceUi()
         {
             const int groupTop = 724;   // where grpResults currently sits
-            const int groupHeight = 96;
+            const int groupHeight = 130;
             const int shift = groupHeight + 8;
 
             grpMultiInstance = new GroupBox
@@ -126,22 +144,24 @@ namespace RockeyPasswordTester
                 TabStop = false
             };
 
-            var lblDongleIndex = new Label { Text = "Dongle #:", AutoSize = true, Location = new System.Drawing.Point(8, 27) };
-            nudDongleIndex = new NumericUpDown
+            var lblDongleIndex = new Label { Text = "Dongle:", AutoSize = true, Location = new System.Drawing.Point(8, 27) };
+            cmbDongle = new ComboBox
             {
-                Location = new System.Drawing.Point(70, 24),
-                Size = new System.Drawing.Size(50, 23),
-                Minimum = 0,
-                Maximum = 31,
-                Value = 0
+                Location = new System.Drawing.Point(60, 24),
+                Size = new System.Drawing.Size(200, 23),
+                DropDownStyle = ComboBoxStyle.DropDownList
             };
+            cmbDongle.SelectedIndexChanged += cmbDongle_SelectedIndexChanged;
             var toolTip = new ToolTip();
-            toolTip.SetToolTip(nudDongleIndex, "0-based index of the dongle this instance uses (0 = first found). Run one app instance per dongle.");
+            toolTip.SetToolTip(cmbDongle, "The dongle this instance uses. Click 'Detect Dongles' to fill this list, then pick one. Run one app instance per dongle.");
+            // Seed with a sensible default so a run works even before Detect is clicked.
+            cmbDongle.Items.Add(DongleOption.FirstFound());
+            cmbDongle.SelectedIndex = 0;
 
             btnDetectDongles = new Button
             {
                 Text = "Detect Dongles",
-                Location = new System.Drawing.Point(128, 23),
+                Location = new System.Drawing.Point(268, 23),
                 Size = new System.Drawing.Size(120, 25)
             };
             btnDetectDongles.Click += btnDetectDongles_Click;
@@ -150,8 +170,8 @@ namespace RockeyPasswordTester
             {
                 Text = "Click 'Detect Dongles' to list connected dongles.",
                 AutoSize = false,
-                Location = new System.Drawing.Point(256, 27),
-                Size = new System.Drawing.Size(466, 20),
+                Location = new System.Drawing.Point(396, 27),
+                Size = new System.Drawing.Size(326, 20),
                 ForeColor = System.Drawing.Color.Gray,
                 AutoEllipsis = true
             };
@@ -184,8 +204,36 @@ namespace RockeyPasswordTester
                 ForeColor = System.Drawing.Color.Gray
             };
 
+            // Row 3: manual reset buttons for testing the recovery on demand (no need to wait for a wedge).
+            var lblResetTest = new Label { Text = "Test reset:", AutoSize = true, Location = new System.Drawing.Point(8, 99) };
+            btnResetL1 = new Button
+            {
+                Text = "Cycle Hub (L1)",
+                Location = new System.Drawing.Point(78, 95),
+                Size = new System.Drawing.Size(140, 25)
+            };
+            btnResetL1.Click += async (s, e) => await ManualResetAsync(1);
+            toolTip.SetToolTip(btnResetL1, "Level 1: power-cycle the dongle's immediate parent hub (re-powers the port so a dropped-off dongle re-enumerates).");
+
+            btnResetL2 = new Button
+            {
+                Text = "Cycle Parent Hub (L2)",
+                Location = new System.Drawing.Point(226, 95),
+                Size = new System.Drawing.Size(150, 25)
+            };
+            btnResetL2.Click += async (s, e) => await ManualResetAsync(2);
+            toolTip.SetToolTip(btnResetL2, "Level 2: power-cycle the next hub up the chain. Disconnects more devices briefly; use if L1 doesn't recover it.");
+
+            var lblResetHint = new Label
+            {
+                Text = "Recovery power-cycles the hub (captured on Detect / at run start). App escalates L1 → L2 automatically.",
+                AutoSize = true,
+                Location = new System.Drawing.Point(384, 99),
+                ForeColor = System.Drawing.Color.Gray
+            };
+
             grpMultiInstance.Controls.Add(lblDongleIndex);
-            grpMultiInstance.Controls.Add(nudDongleIndex);
+            grpMultiInstance.Controls.Add(cmbDongle);
             grpMultiInstance.Controls.Add(btnDetectDongles);
             grpMultiInstance.Controls.Add(lblDongleDetected);
             grpMultiInstance.Controls.Add(lblStartSeed);
@@ -193,6 +241,10 @@ namespace RockeyPasswordTester
             grpMultiInstance.Controls.Add(lblStopSeed);
             grpMultiInstance.Controls.Add(txtStopSeed);
             grpMultiInstance.Controls.Add(lblRangeHint);
+            grpMultiInstance.Controls.Add(lblResetTest);
+            grpMultiInstance.Controls.Add(btnResetL1);
+            grpMultiInstance.Controls.Add(btnResetL2);
+            grpMultiInstance.Controls.Add(lblResetHint);
 
             Controls.Add(grpMultiInstance);
 
@@ -340,10 +392,19 @@ namespace RockeyPasswordTester
             btnClear.Enabled = false;
             grpMultiInstance.Enabled = false;
 
-            // Bind this run to the selected dongle and work out which physical device to reset if it
-            // wedges. Done here (not only on the Detect button) so the reset targets the right dongle
-            // even if the user never clicked Detect.
-            ResolveSelectedDongle(GetPhysicalDongleInstanceIds(), (int)nudDongleIndex.Value);
+            // Bind this run to the selected dongle and capture its hub chain for later recovery.
+            // These spawn powershell.exe (Get-PnpDevice), which is slow, so run them OFF the UI thread
+            // to keep the app responsive - doing them inline here is what made "Start" freeze for
+            // seconds. Done here (not only on Detect) so the reset targets the right dongle/hub even if
+            // the user never clicked Detect.
+            int selectedIndex = CurrentDongleSelection().Index;
+            lblStatus.Text = "Detecting dongle / hub...";
+            await Task.Run(() =>
+            {
+                ResolveSelectedDongle(GetPhysicalDongleInstanceIds(), selectedIndex);
+                LoadHubChain();          // this index's last-known hub, in case the dongle is already absent
+                CaptureDongleHubChain(); // refresh while it's present (it drops off the bus when wedged)
+            });
 
             txtResults.Clear();
             _seedsTested = 0;
@@ -570,44 +631,16 @@ namespace RockeyPasswordTester
 
                 string errorTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
 
-                if (ex.Message.Contains("Automatic restart will be attempted"))
+                // Recovery is handled inside RunWithOpenDongle; if it gives up, we stop cleanly and ask
+                // for a physical replug. We do NOT auto-restart the whole test (that previously caused
+                // an unstoppable restart loop when a dongle stayed dead).
+                this.Invoke((MethodInvoker)delegate
                 {
-                    // Dongle recovery failed - physical reset required
-                    this.Invoke((MethodInvoker)delegate
-                    {
-                        txtResults.AppendText($"\r\n✗ [{errorTime}] Software reset failed. Physical dongle reset required.\r\n");
-                        txtResults.AppendText($"   Please disconnect and reconnect the USB dongle, then click Start.\r\n");
-                        txtResults.AppendText($"   The test will resume from: {_lastTestedSeed}\r\n");
-                        txtResults.ScrollToCaret();
-                        lblStatus.Text = "Waiting for manual dongle reconnection...";
-                    });
-                }
-                else if (ex.Message.Contains("RY_SEED failed"))
-                {
-                    // RY_SEED errors detected - trigger recovery
-                    this.Invoke((MethodInvoker)delegate
-                    {
-                        txtResults.AppendText($"\r\n✗ [{errorTime}] Dongle command failures detected. Initiating recovery...\r\n");
-                        txtResults.ScrollToCaret();
-                        lblStatus.Text = "Attempting recovery...";
-                    });
-
-                    // Attempt restart
-                    this.Invoke((MethodInvoker)delegate
-                    {
-                        btnTest_Click(null, null);
-                    });
-                }
-                else
-                {
-                    // Other unrecoverable error
-                    this.Invoke((MethodInvoker)delegate
-                    {
-                        txtResults.AppendText($"\r\n✗ [{errorTime}] Testing stopped: {ex.Message}\r\n");
-                        txtResults.ScrollToCaret();
-                        lblStatus.Text = "Testing stopped - manual intervention required.";
-                    });
-                }
+                    txtResults.AppendText($"\r\n✗ [{errorTime}] {ex.Message}\r\n");
+                    txtResults.AppendText($"   Please disconnect and reconnect the USB dongle, then click Start to resume from: {_lastTestedSeed}\r\n");
+                    txtResults.ScrollToCaret();
+                    lblStatus.Text = "Stopped - reconnect the dongle and click Start to resume.";
+                });
             }
             catch (Exception ex)
             {
@@ -695,12 +728,14 @@ namespace RockeyPasswordTester
 
         private void RunWithOpenDongle(ushort p1, ushort p2, ushort p3, ushort p4, DongleOperation operation, CancellationToken cancellationToken)
         {
-            const int MAX_DONGLE_RETRY_ATTEMPTS = 2;
+            const int MAX_DONGLE_RETRY_ATTEMPTS = 3; // attempt 0 -> reset level 1, attempt 1 -> level 2, then give up
             const int FIND_RETRY_ATTEMPTS = 5;
             int retryAttempt = 0;
 
-            while (retryAttempt < MAX_DONGLE_RETRY_ATTEMPTS)
+            while (true)
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 Rockey4SmartClass.Rockey4Smart r4s = new Rockey4SmartClass.Rockey4Smart();
                 ushort handle = 0;
                 uint lp1 = 0;
@@ -719,18 +754,16 @@ namespace RockeyPasswordTester
                     ushort retcode = 1;
                     for (int findAttempt = 0; findAttempt < FIND_RETRY_ATTEMPTS; findAttempt++)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         retcode = r4s.Rockey(RY_FIND, ref handle, ref lp1, ref lp2, ref openP1, ref openP2, ref openP3, ref openP4, buffer);
                         if (retcode == 0) break;
 
                         if (findAttempt < FIND_RETRY_ATTEMPTS - 1)
                         {
-                            string logMsg = $"   RY_FIND attempt {findAttempt + 1}/{FIND_RETRY_ATTEMPTS} failed (code {retcode}). Retrying...";
-                            BeginInvoke((MethodInvoker)delegate
-                            {
-                                txtResults.AppendText($"{logMsg}\r\n");
-                                txtResults.ScrollToCaret();
-                            });
-                            Thread.Sleep(1000); // Wait 1 second between find attempts
+                            AppendResult($"   RY_FIND attempt {findAttempt + 1}/{FIND_RETRY_ATTEMPTS} failed (code {retcode}). Retrying...");
+                            // Cancellable 1s wait (returns immediately if the user clicks Stop).
+                            if (cancellationToken.WaitHandle.WaitOne(1000))
+                                throw new OperationCanceledException(cancellationToken);
                         }
                     }
 
@@ -739,30 +772,49 @@ namespace RockeyPasswordTester
                         throw new InvalidOperationException($"ROCKEY not found after {FIND_RETRY_ATTEMPTS} attempts. Last error code: {retcode}");
                     }
 
-                    // Advance to the dongle this instance is bound to. RY_FIND landed on dongle #0;
-                    // step RY_FIND_NEXT to reach the selected index so multiple app instances can
-                    // each drive a different physical dongle.
+                    // Advance to the dongle this instance is bound to. RY_FIND landed on dongle #0
+                    // (its hardware ID is in lp1). We then step RY_FIND_NEXT so multiple app instances
+                    // can each drive a different physical dongle.
                     int dongleIndex;
-                    lock (_dongleSelectionLock) { dongleIndex = _selectedDongleIndex; }
+                    uint? wantHid;
+                    lock (_dongleSelectionLock) { dongleIndex = _selectedDongleIndex; wantHid = _selectedDongleHid; }
                     uint selectedHid = lp1;
-                    for (int step = 0; step < dongleIndex; step++)
+
+                    if (wantHid.HasValue)
                     {
-                        openP1 = p1; openP2 = p2; openP3 = p3; openP4 = p4;
-                        retcode = r4s.Rockey(RY_FIND_NEXT, ref handle, ref lp1, ref lp2, ref openP1, ref openP2, ref openP3, ref openP4, buffer);
-                        if (retcode != 0)
+                        // Preferred path (user picked a dongle in the list): walk to the exact hardware
+                        // ID. Robust even if the SDK enumerates the dongles in a different order than it
+                        // did at Detect time - which is what made index-based selection unreliable.
+                        int guard = 0;
+                        while (selectedHid != wantHid.Value)
                         {
-                            throw new InvalidOperationException($"Dongle #{dongleIndex} not found (only {step + 1} dongle(s) present). RY_FIND_NEXT returned error code {retcode}.");
+                            if (guard++ >= 64)
+                                throw new InvalidOperationException($"Dongle with hardware ID 0x{wantHid.Value:X8} not found among the connected dongles.");
+                            openP1 = p1; openP2 = p2; openP3 = p3; openP4 = p4;
+                            retcode = r4s.Rockey(RY_FIND_NEXT, ref handle, ref lp1, ref lp2, ref openP1, ref openP2, ref openP3, ref openP4, buffer);
+                            if (retcode != 0)
+                                throw new InvalidOperationException($"Dongle with hardware ID 0x{wantHid.Value:X8} not found. RY_FIND_NEXT returned error code {retcode}.");
+                            selectedHid = lp1;
                         }
-                        selectedHid = lp1;
+                        AppendResult($"   Bound to dongle #{dongleIndex} (hardware ID 0x{selectedHid:X8}).");
                     }
-                    if (dongleIndex > 0)
+                    else
                     {
-                        uint hidForLog = selectedHid;
-                        BeginInvoke((MethodInvoker)delegate
+                        // Fallback (Detect never run): step by index as before.
+                        for (int step = 0; step < dongleIndex; step++)
                         {
-                            txtResults.AppendText($"   Bound to dongle #{dongleIndex} (hardware ID 0x{hidForLog:X8}).\r\n");
-                            txtResults.ScrollToCaret();
-                        });
+                            openP1 = p1; openP2 = p2; openP3 = p3; openP4 = p4;
+                            retcode = r4s.Rockey(RY_FIND_NEXT, ref handle, ref lp1, ref lp2, ref openP1, ref openP2, ref openP3, ref openP4, buffer);
+                            if (retcode != 0)
+                            {
+                                throw new InvalidOperationException($"Dongle #{dongleIndex} not found (only {step + 1} dongle(s) present). RY_FIND_NEXT returned error code {retcode}.");
+                            }
+                            selectedHid = lp1;
+                        }
+                        if (dongleIndex > 0)
+                        {
+                            AppendResult($"   Bound to dongle #{dongleIndex} (hardware ID 0x{selectedHid:X8}).");
+                        }
                     }
 
                     openP1 = p1;
@@ -784,48 +836,60 @@ namespace RockeyPasswordTester
                     });
 
                     operation(r4s, handle, openP1, openP2, openP3, openP4, cancellationToken);
-                    return; // Success - exit retry loop
+
+                    // The operation returns normally both on completion AND on cancel (it breaks out of
+                    // its loop). Distinguish so a Stop shows "cancelled" rather than "complete".
+                    if (cancellationToken.IsCancellationRequested)
+                        throw new OperationCanceledException(cancellationToken);
+                    return; // genuine completion
                 }
-                catch (InvalidOperationException ex) when (retryAttempt < MAX_DONGLE_RETRY_ATTEMPTS - 1)
+                catch (OperationCanceledException)
                 {
-                    // Dongle error - attempt recovery
-                    string errorTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-                    string errorMessage = $"✗ [{errorTime}] Dongle error: {ex.Message}";
-
-                    BeginInvoke((MethodInvoker)delegate
+                    throw; // Stop requested - let it propagate cleanly, don't treat as a dongle error
+                }
+                catch (InvalidOperationException ex)
+                {
+                    // Release the SDK handle BEFORE resetting. Disabling a USB device while our own
+                    // process still holds it open can leave the device busy and make the disable a
+                    // no-op. Closing first lets Windows fully remove and re-enumerate it.
+                    if (opened)
                     {
-                        txtResults.AppendText($"{errorMessage}\r\n");
-                        txtResults.AppendText($"   Attempting automatic dongle reset (attempt {retryAttempt + 1}/{MAX_DONGLE_RETRY_ATTEMPTS})...\r\n");
-                        txtResults.ScrollToCaret();
-                    });
-
-                    // Reset dongle synchronously with longer wait
-                    Task resetTask = Task.Run(async () =>
-                    {
-                        bool resetSuccess = await ResetUsbDongleAsync();
-
-                        if (resetSuccess)
+                        try
                         {
-                            string recoveryTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-                            BeginInvoke((MethodInvoker)delegate
-                            {
-                                txtResults.AppendText($"✓ [{recoveryTime}] Dongle reset successful. Waiting for re-initialization...\r\n");
-                                txtResults.ScrollToCaret();
-                            });
+                            ushort ch = handle; uint clp1 = 0, clp2 = 0;
+                            ushort cp1 = p1, cp2 = p2, cp3 = p3, cp4 = p4;
+                            r4s.Rockey(RY_CLOSE, ref ch, ref clp1, ref clp2, ref cp1, ref cp2, ref cp3, ref cp4, buffer);
                         }
-                    });
-
-                    if (!resetTask.Wait(15000))
-                    {
-                        resetTask.Wait(); // Wait indefinitely if needed
+                        catch { }
+                        opened = false;
                     }
 
-                    // Additional wait to ensure dongle is fully re-initialized
-                    BeginInvoke((MethodInvoker)delegate
+                    if (cancellationToken.IsCancellationRequested)
+                        throw new OperationCanceledException(cancellationToken);
+
+                    string errorTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                    AppendResult($"✗ [{errorTime}] Dongle error: {ex.Message}");
+
+                    // Give up after the last attempt instead of looping forever.
+                    if (retryAttempt >= MAX_DONGLE_RETRY_ATTEMPTS - 1)
                     {
-                        txtResults.AppendText($"   Waiting {USB_RESET_RETRY_DELAY_MS / 1000} seconds for dongle to re-initialize...\r\n");
-                    });
-                    Thread.Sleep(USB_RESET_RETRY_DELAY_MS);
+                        throw new InvalidOperationException($"Dongle did not recover after {MAX_DONGLE_RETRY_ATTEMPTS} automatic attempts.");
+                    }
+
+                    // Escalate: level 1 (immediate hub) on the first wedge, level 2 (next hub up) after.
+                    int resetLevel = retryAttempt + 1;
+                    AppendResult($"   Automatic recovery attempt {retryAttempt + 1}/{MAX_DONGLE_RETRY_ATTEMPTS - 1} (reset level {resetLevel})...");
+                    try
+                    {
+                        ResetUsbDongleAsync(resetLevel, cancellationToken).Wait(cancellationToken);
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (AggregateException) { /* reset itself failed; fall through to wait + retry */ }
+
+                    // Give the dongle time to re-initialise - but bail out instantly if Stop is clicked.
+                    AppendResult($"   Waiting {USB_RESET_RETRY_DELAY_MS / 1000}s for the dongle to re-initialise...");
+                    if (cancellationToken.WaitHandle.WaitOne(USB_RESET_RETRY_DELAY_MS))
+                        throw new OperationCanceledException(cancellationToken);
 
                     retryAttempt++;
                 }
@@ -855,137 +919,257 @@ namespace RockeyPasswordTester
                     }
                 }
             }
-
-            // If we exhausted all retries, throw exception to trigger automatic test restart
-            throw new InvalidOperationException("Dongle failed to recover after multiple reset attempts. Automatic restart will be attempted.");
         }
 
-        private async Task<bool> ResetUsbDongleAsync()
+        // Recovery works by power-cycling the USB HUB the dongle sits on: when the dongle wedges it
+        // drops OFF the bus, so its own device node is gone and only re-powering the port brings it
+        // back. `level` escalates UP the captured hub chain: level 1 = immediate hub (least
+        // disruptive), level 2 = the next hub up, etc. If we have no hub info at all we fall back to
+        // toggling the device node (only useful if it's still present).
+        private async Task<bool> ResetUsbDongleAsync(int level = 1, CancellationToken cancellationToken = default)
         {
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
+                // Refresh the hub chain if the dongle happens to be present right now; otherwise use
+                // what we captured while it was healthy. Off the UI thread (spawns powershell.exe) so a
+                // manual reset can't freeze the window.
+                await Task.Run(() => CaptureDongleHubChain(), cancellationToken);
+
                 string? targetInstanceId;
+                string? hubToCycle;
                 lock (_dongleSelectionLock)
                 {
                     targetInstanceId = _selectedUsbInstanceId;
+                    hubToCycle = _dongleHubChain.Count > 0
+                        ? _dongleHubChain[Math.Min(Math.Max(level - 1, 0), _dongleHubChain.Count - 1)]
+                        : null;
                 }
 
-                BeginInvoke((MethodInvoker)delegate
+                // No hub known -> device-node toggle fallback (no shared-hub concern here).
+                if (string.IsNullOrEmpty(hubToCycle))
                 {
-                    string what = string.IsNullOrEmpty(targetInstanceId) ? $"all {ROCKEY_HARDWARE_ID} devices" : targetInstanceId;
-                    txtResults.AppendText($"   Virtually unplugging/replugging dongle ({what})...\r\n");
-                    lblStatus.Text = "Resetting USB dongle...";
-                });
+                    AppendResult($"   Reset level {level}: no hub captured yet - toggling device node.");
+                    AppendResult("   (Tip: click 'Detect Dongles' or start a run while the dongle works so the hub can be remembered.)");
+                    return await RunElevatedScriptAsync(BuildResetScript(targetInstanceId, null), cancellationToken);
+                }
 
-                string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(BuildResetScript(targetInstanceId)));
-                var psi = new ProcessStartInfo
+                // Cross-instance coordination. Cycling a hub disconnects EVERY dongle on it, so if
+                // several app instances share a hub we must ensure only one instance cycles it and the
+                // others recognise the disconnect as "a sibling is resetting the hub" - wait and
+                // reconnect - instead of each firing its own reset (which would cascade endlessly).
+                if (IsHubResetActive(hubToCycle))
                 {
-                    FileName = "powershell.exe",
-                    Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + encoded,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
+                    AppendResult($"   Another instance is power-cycling hub {hubToCycle}.");
+                    AppendResult("   Waiting for it to finish instead of resetting again...");
+                    await WaitForHubResetToClearAsync(hubToCycle, TimeSpan.FromSeconds(60), cancellationToken);
+                    AppendResult("   Sibling hub reset finished. Reconnecting to the dongle...");
+                    return true; // let the caller re-FIND/OPEN
+                }
 
-                using (var process = Process.Start(psi))
+                using var gate = new Semaphore(1, 1, HubResetSemaphoreName(hubToCycle));
+                // Cancellable acquire: wake on the semaphore OR the cancellation handle, up to 30s.
+                int waitResult = await Task.Run(() =>
+                    WaitHandle.WaitAny(new[] { gate, cancellationToken.WaitHandle }, TimeSpan.FromSeconds(30)));
+                if (waitResult == 1) throw new OperationCanceledException(cancellationToken);
+                bool acquired = waitResult == 0;
+                try
                 {
-                    if (process == null)
+                    if (!acquired)
                     {
-                        BeginInvoke((MethodInvoker)delegate
-                        {
-                            txtResults.AppendText($"   ✗ Could not start reset helper.\r\n");
-                        });
-                        return false;
-                    }
-
-                    // Read output on background threads while waiting, to avoid deadlocking on full pipes.
-                    Task<string> outTask = process.StandardOutput.ReadToEndAsync();
-                    Task<string> errTask = process.StandardError.ReadToEndAsync();
-
-                    bool finished = await Task.Run(() => process.WaitForExit(25000));
-                    if (!finished)
-                    {
-                        try { process.Kill(); } catch { }
-                        BeginInvoke((MethodInvoker)delegate
-                        {
-                            txtResults.AppendText($"   ✗ Reset timeout\r\n");
-                        });
-                        return false;
-                    }
-
-                    string output = string.Empty;
-                    string error = string.Empty;
-                    try { output = await outTask; } catch { }
-                    try { error = await errTask; } catch { }
-                    int exitCode = process.ExitCode;
-
-                    string outTrim = output.Trim();
-                    string errTrim = error.Trim();
-
-                    BeginInvoke((MethodInvoker)delegate
-                    {
-                        if (!string.IsNullOrWhiteSpace(outTrim))
-                            txtResults.AppendText($"   {outTrim.Replace("\n", "\r\n   ")}\r\n");
-                    });
-
-                    if (exitCode == 0)
-                    {
-                        BeginInvoke((MethodInvoker)delegate
-                        {
-                            txtResults.AppendText($"   ✓ Dongle reset successful (you should hear the USB disconnect/reconnect chime).\r\n");
-                        });
+                        AppendResult("   Timed out waiting for the hub lock; another instance is likely handling it. Reconnecting...");
                         return true;
                     }
 
-                    BeginInvoke((MethodInvoker)delegate
+                    // A sibling may have cycled the hub while we queued on the lock. If our dongle is
+                    // back on the bus, skip a redundant cycle (a wedged dongle is OFF the bus, so
+                    // "present" here means recovered).
+                    if (IsMyDonglePresent())
                     {
-                        txtResults.AppendText($"   ✗ Reset failed (exit code {exitCode}).\r\n");
-                        if (!string.IsNullOrWhiteSpace(errTrim))
-                            txtResults.AppendText($"   Error: {errTrim}\r\n");
-                        if (exitCode == 1)
-                            txtResults.AppendText($"   The dongle was not found in Device Manager. Is it plugged in?\r\n");
-                    });
-                    return false;
+                        AppendResult("   Hub was already power-cycled by another instance; dongle is back. Reconnecting...");
+                        return true;
+                    }
+
+                    SetHubResetMarker(hubToCycle, TimeSpan.FromSeconds(45));
+                    AppendResult($"   Reset level {level}: power-cycling hub {hubToCycle}...");
+                    return await RunElevatedScriptAsync(BuildResetScript(targetInstanceId, hubToCycle), cancellationToken);
+                }
+                finally
+                {
+                    ClearHubResetMarker(hubToCycle);
+                    if (acquired) { try { gate.Release(); } catch { } }
                 }
             }
             catch (Exception ex)
             {
-                BeginInvoke((MethodInvoker)delegate
-                {
-                    txtResults.AppendText($"   ✗ Reset exception: {ex.Message}\r\n");
-                });
+                AppendResult($"   ✗ Reset exception: {ex.Message}");
                 return false;
             }
         }
 
-        // Builds the PowerShell script that disables then re-enables the physical dongle device
-        // node - the software equivalent of unplugging and replugging it. Requires the app to run
-        // elevated (see app.manifest); Disable-PnpDevice/Enable-PnpDevice fail without admin.
-        // The script is passed via -EncodedCommand (Base64 UTF-16LE), so no quote/newline escaping
-        // is needed here.
-        private static string BuildResetScript(string? targetInstanceId)
+        // Launches the elevated PowerShell reset/cycle script, streams its output to the results box,
+        // and returns true on exit code 0. Killed promptly if the run is cancelled.
+        private async Task<bool> RunElevatedScriptAsync(string script, CancellationToken cancellationToken = default)
         {
-            // Selection line: an exact InstanceId for this instance's dongle when known, otherwise
-            // every top-level USB node matching the Rockey hardware id (single-dongle fallback).
-            // Note: the dongle's top-level USB-bus node enumerates under Class HIDClass (it's a HID
-            // device), so we must NOT filter by Class 'USB'. We match on the "USB\VID_096E&PID_0006"
-            // InstanceId prefix, which selects the USB device node (disabling it cascades to the HID
-            // child = a real replug) while excluding the "HID\..." function children.
-            string selection;
-            if (!string.IsNullOrEmpty(targetInstanceId))
+            string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+            var psi = new ProcessStartInfo
             {
-                selection = "$dev = Get-PnpDevice -InstanceId '" + EscapePsSingleQuoted(targetInstanceId) +
-                            "' -ErrorAction Stop";
-            }
-            else
+                FileName = "powershell.exe",
+                Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + encoded,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var process = Process.Start(psi);
+            if (process == null) { AppendResult("   ✗ Could not start reset helper."); return false; }
+
+            // Kill the helper if the user clicks Stop mid-reset.
+            using var reg = cancellationToken.Register(() => { try { process.Kill(); } catch { } });
+
+            Task<string> outTask = process.StandardOutput.ReadToEndAsync();
+            Task<string> errTask = process.StandardError.ReadToEndAsync();
+
+            bool finished = await Task.Run(() => process.WaitForExit(25000));
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!finished)
             {
-                selection = "$dev = Get-PnpDevice -PresentOnly -ErrorAction Stop | " +
-                            "Where-Object { $_.InstanceId -like '" + EscapePsSingleQuoted(ROCKEY_HARDWARE_ID) + "*' }";
+                try { process.Kill(); } catch { }
+                AppendResult("   ✗ Reset timeout");
+                return false;
             }
 
-            // Verbatim (non-interpolated) string: only " needs doubling; braces are literal.
-            string script = @"
+            string output = string.Empty, error = string.Empty;
+            try { output = await outTask; } catch { }
+            try { error = await errTask; } catch { }
+            int exitCode = process.ExitCode;
+
+            string outTrim = output.Trim(), errTrim = error.Trim();
+            if (!string.IsNullOrWhiteSpace(outTrim)) AppendResult("   " + outTrim.Replace("\n", "\r\n   "));
+
+            if (exitCode == 0)
+            {
+                AppendResult("   ✓ Reset command completed (you should hear the USB disconnect/reconnect chime).");
+                return true;
+            }
+
+            AppendResult($"   ✗ Reset failed (exit code {exitCode}).");
+            if (!string.IsNullOrWhiteSpace(errTrim)) AppendResult("   Error: " + errTrim);
+            if (exitCode == 1) AppendResult("   The device/hub was not found. Is it plugged in?");
+            return false;
+        }
+
+        private void AppendResult(string text)
+        {
+            if (!IsHandleCreated) return;
+            BeginInvoke((MethodInvoker)delegate
+            {
+                txtResults.AppendText(text + "\r\n");
+                txtResults.ScrollToCaret();
+            });
+        }
+
+        private bool IsMyDonglePresent()
+        {
+            var present = GetPhysicalDongleInstanceIds();
+            string? myId;
+            lock (_dongleSelectionLock) { myId = _selectedUsbInstanceId; }
+            if (!string.IsNullOrEmpty(myId))
+                return present.Any(x => string.Equals(x, myId, StringComparison.OrdinalIgnoreCase));
+            return present.Count > 0;
+        }
+
+        // ---- Cross-instance hub-reset coordination -------------------------------------------
+        // A named Semaphore serialises the cycle across processes; a small marker file (with an
+        // expiry, so a crashed process can't wedge the lock forever) tells sibling instances a reset
+        // is in progress for that hub. Both are keyed by a hash of the hub InstanceId, so only
+        // instances sharing the SAME physical hub coordinate; dongles on other hubs are independent.
+
+        private static string HubResetKey(string hubId)
+        {
+            using var sha = System.Security.Cryptography.SHA1.Create();
+            byte[] h = sha.ComputeHash(Encoding.UTF8.GetBytes(hubId.ToUpperInvariant()));
+            return Convert.ToHexString(h, 0, 8);
+        }
+
+        private static string HubResetSemaphoreName(string hubId) => @"Global\RockeyHubReset_" + HubResetKey(hubId);
+
+        private static string HubResetMarkerPath(string hubId) =>
+            Path.Combine(Path.GetTempPath(), "rockey-hubreset-" + HubResetKey(hubId) + ".lock");
+
+        private static bool IsHubResetActive(string hubId)
+        {
+            try
+            {
+                string path = HubResetMarkerPath(hubId);
+                if (!File.Exists(path)) return false;
+                if (long.TryParse(File.ReadAllText(path).Trim(), out long expiryTicks))
+                    return DateTime.UtcNow.Ticks < expiryTicks;
+                return false;
+            }
+            catch { return false; }
+        }
+
+        private static void SetHubResetMarker(string hubId, TimeSpan duration)
+        {
+            try { File.WriteAllText(HubResetMarkerPath(hubId), (DateTime.UtcNow + duration).Ticks.ToString(CultureInfo.InvariantCulture)); }
+            catch { /* best effort */ }
+        }
+
+        private static void ClearHubResetMarker(string hubId)
+        {
+            try { string p = HubResetMarkerPath(hubId); if (File.Exists(p)) File.Delete(p); }
+            catch { /* best effort */ }
+        }
+
+        private static async Task WaitForHubResetToClearAsync(string hubId, TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            var sw = Stopwatch.StartNew();
+            while (IsHubResetActive(hubId) && sw.Elapsed < timeout)
+                await Task.Delay(500, cancellationToken);
+        }
+
+        // Builds the PowerShell recovery script, passed via -EncodedCommand (Base64 UTF-16LE) so no
+        // quote/newline escaping is needed. Requires elevation (see app.manifest).
+        //   - hubInstanceId set  -> disable+enable that HUB (re-powers the port, re-enumerates a
+        //     dongle that dropped off the bus). This is the real fix.
+        //   - hubInstanceId null -> fall back to toggling the dongle's own device node (only helps
+        //     if it's still present).
+        private static string BuildResetScript(string? targetInstanceId, string? hubInstanceId)
+        {
+            if (!string.IsNullOrEmpty(hubInstanceId))
+            {
+                string hub = EscapePsSingleQuoted(hubInstanceId);
+                // Verbatim string: braces are literal; only " would need doubling (none here).
+                return @"
+$ErrorActionPreference = 'Stop'
+try {
+    $hubId = '" + hub + @"'
+    $ph = Get-PnpDevice -InstanceId $hubId -ErrorAction Stop
+    Write-Host ('Power-cycling hub ' + $hubId + ' (' + $ph.FriendlyName + ')')
+    Disable-PnpDevice -InstanceId $hubId -Confirm:$false -ErrorAction Stop
+    Write-Host 'Hub disabled'
+    Start-Sleep -Seconds 3
+    Enable-PnpDevice -InstanceId $hubId -Confirm:$false -ErrorAction Stop
+    Write-Host 'Hub enabled'
+    Start-Sleep -Seconds 4
+    Write-Host 'Hub power-cycle complete'
+    exit 0
+} catch {
+    Write-Host ('Error: ' + $_)
+    exit 3
+}";
+            }
+
+            // Fallback: toggle the dongle's own device node. The top-level USB node enumerates under
+            // Class HIDClass, so match by the "USB\VID_096E&PID_0006" InstanceId prefix (the "USB\"
+            // prefix excludes the "HID\..." children).
+            string selection = !string.IsNullOrEmpty(targetInstanceId)
+                ? "$dev = Get-PnpDevice -InstanceId '" + EscapePsSingleQuoted(targetInstanceId) + "' -ErrorAction Stop"
+                : "$dev = Get-PnpDevice -PresentOnly -ErrorAction Stop | Where-Object { $_.InstanceId -like '" + EscapePsSingleQuoted(ROCKEY_HARDWARE_ID) + "*' }";
+
+            return @"
 $ErrorActionPreference = 'Stop'
 try {
     " + selection + @"
@@ -1006,8 +1190,6 @@ try {
     Write-Host ('Error: ' + $_)
     exit 3
 }";
-
-            return script;
         }
 
         private static string EscapePsSingleQuoted(string value)
@@ -1081,10 +1263,53 @@ try {
                     CreateNoWindow = true
                 };
 
-                using var p = Process.Start(psi);
+                list = RunPowerShellCaptureLines(script, 10000);
+            }
+            catch { /* best effort */ }
+            return list;
+        }
+
+        // Runs a short PowerShell script and returns its non-empty stdout lines. Read-only PnP
+        // queries don't need elevation. Best-effort: returns whatever it captured.
+        private static List<string> RunPowerShellCaptureLines(string script, int timeoutMs)
+        {
+            var list = new List<string>();
+            string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+            var psi = new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            Process? p = null;
+            try
+            {
+                p = Process.Start(psi);
                 if (p == null) return list;
-                string outp = p.StandardOutput.ReadToEnd();
-                p.WaitForExit(10000);
+
+                // Drain BOTH streams asynchronously and enforce the timeout by killing a wedged
+                // process. The old code did a synchronous StandardOutput.ReadToEnd() (which has no
+                // timeout) BEFORE WaitForExit(timeoutMs), so the timeout never applied: if powershell
+                // stalled - e.g. walking a longer parent-hub chain when the dongle is behind a USB hub,
+                // or filling the un-drained stderr pipe - ReadToEnd blocked forever, freezing the UI on
+                // Detect and hanging the pre-run hub capture on Start.
+                var outTask = p.StandardOutput.ReadToEndAsync();
+                var errTask = p.StandardError.ReadToEndAsync();
+
+                if (!p.WaitForExit(timeoutMs))
+                {
+                    try { p.Kill(entireProcessTree: true); } catch { /* best effort */ }
+                    return list;
+                }
+
+                string outp = string.Empty;
+                try { outp = outTask.GetAwaiter().GetResult(); } catch { /* best effort */ }
+                try { _ = errTask.GetAwaiter().GetResult(); } catch { /* drained, ignored */ }
+
                 foreach (var line in outp.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
                 {
                     string trimmed = line.Trim();
@@ -1092,7 +1317,68 @@ try {
                 }
             }
             catch { /* best effort */ }
+            finally
+            {
+                try { p?.Dispose(); } catch { /* best effort */ }
+            }
             return list;
+        }
+
+        // Queries the dongle's parent USB hub chain (immediate hub first, up to and including the
+        // root hub) while the physical device is present. Stops before the PCI host controller.
+        private List<string> QueryDongleHubChain()
+        {
+            string hw = EscapePsSingleQuoted(ROCKEY_HARDWARE_ID);
+            string script =
+                "$dev = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | " +
+                "Where-Object { $_.InstanceId -like '" + hw + "*' }; " +
+                "if ($dev) { $cur = (@($dev)[0]).InstanceId; for ($i=0; $i -lt 8; $i++) { " +
+                "$p = (Get-PnpDeviceProperty -InstanceId $cur -KeyName 'DEVPKEY_Device_Parent' -ErrorAction SilentlyContinue).Data; " +
+                "if (-not $p) { break }; " +
+                "if ($p -like 'PCI\\*') { break }; " +
+                "if (($p -like 'ROOT\\*') -and ($p -notlike 'USB\\ROOT_HUB*')) { break }; " +
+                "$p; $cur = $p; " +
+                "if ($p -like 'USB\\ROOT_HUB*') { break } } }";
+            try { return RunPowerShellCaptureLines(script, 10000); }
+            catch { return new List<string>(); }
+        }
+
+        // Captures & persists the hub chain if the dongle is currently present. No-op if it's absent
+        // (we keep whatever we captured last time).
+        private void CaptureDongleHubChain()
+        {
+            var chain = QueryDongleHubChain();
+            if (chain.Count == 0) return;
+            int index;
+            lock (_dongleSelectionLock)
+            {
+                index = _selectedDongleIndex;
+                _dongleHubChain.Clear();
+                _dongleHubChain.AddRange(chain);
+            }
+            try { File.WriteAllLines(HubChainFilePath(index), chain); } catch { /* best effort */ }
+        }
+
+        private void LoadHubChain()
+        {
+            try
+            {
+                int index;
+                lock (_dongleSelectionLock) { index = _selectedDongleIndex; }
+                string path = HubChainFilePath(index);
+                if (!File.Exists(path)) return;
+                var lines = File.ReadAllLines(path);
+                lock (_dongleSelectionLock)
+                {
+                    _dongleHubChain.Clear();
+                    foreach (var l in lines)
+                    {
+                        string t = l.Trim();
+                        if (t.Length > 0) _dongleHubChain.Add(t);
+                    }
+                }
+            }
+            catch { /* best effort */ }
         }
 
         // Records which dongle index this instance uses and the physical InstanceId to reset for it.
@@ -1109,6 +1395,38 @@ try {
             }
         }
 
+        // One entry in the dongle picker. Index is the SDK enumeration position (RY_FIND = 0, then one
+        // per RY_FIND_NEXT); Hid is the SDK hardware ID used to bind to this exact dongle regardless of
+        // enumeration order. UsbInstanceId pairs it (best-effort) with a Windows device for reset.
+        private sealed class DongleOption
+        {
+            public int Index { get; init; }
+            public uint? Hid { get; init; }
+            public string? UsbInstanceId { get; init; }
+
+            // The pre-Detect default: bind to whatever dongle RY_FIND lands on first.
+            public static DongleOption FirstFound() => new DongleOption { Index = 0, Hid = null };
+
+            public override string ToString() =>
+                Hid.HasValue ? $"#{Index} — HID 0x{Hid.Value:X8}" : "#0 (first found)";
+        }
+
+        // The currently picked entry (UI thread only). Never null: falls back to the "first found"
+        // default so a run works even before Detect has ever been clicked.
+        private DongleOption CurrentDongleSelection() =>
+            cmbDongle.SelectedItem as DongleOption ?? DongleOption.FirstFound();
+
+        private void cmbDongle_SelectedIndexChanged(object? sender, EventArgs e)
+        {
+            if (cmbDongle.SelectedItem is not DongleOption opt) return;
+            lock (_dongleSelectionLock)
+            {
+                _selectedDongleIndex = opt.Index;
+                _selectedDongleHid = opt.Hid;
+                _selectedUsbInstanceId = opt.UsbInstanceId;
+            }
+        }
+
         private async void btnDetectDongles_Click(object? sender, EventArgs e)
         {
             btnDetectDongles.Enabled = false;
@@ -1122,25 +1440,66 @@ try {
                 await RunOnStaThreadAsync(() => { hids = EnumerateSdkDongles(p1, p2, p3, p4); });
                 List<string> usb = await Task.Run(() => GetPhysicalDongleInstanceIds());
 
-                int idx = (int)nudDongleIndex.Value;
-                ResolveSelectedDongle(usb, idx);
+                // Keep the user's current pick (by hardware ID) selected across a re-detect.
+                uint? previousHid;
+                lock (_dongleSelectionLock) { previousHid = _selectedDongleHid; }
 
-                string hidStr = hids.Count > 0
-                    ? string.Join(", ", hids.ConvertAll(h => "0x" + h.ToString("X8")))
-                    : "none";
-                string resetTarget = _selectedUsbInstanceId ?? "(all Rockey devices - VID/PID fallback)";
-
-                lblDongleDetected.ForeColor = (hids.Count > 0 || usb.Count > 0)
-                    ? System.Drawing.Color.Black
-                    : System.Drawing.Color.Red;
-                lblDongleDetected.Text =
-                    $"SDK found {hids.Count} dongle(s) [{hidStr}]; Windows sees {usb.Count} USB device(s). " +
-                    $"This instance uses #{idx}; reset target: {resetTarget}";
-
-                if (idx >= Math.Max(hids.Count, usb.Count))
+                // Rebuild the picker from the SDK-enumerated dongles - the same order the run walks with
+                // RY_FIND / RY_FIND_NEXT, so the chosen HID maps to the right device. Pairing each with a
+                // Windows USB InstanceId (for reset targeting) is best-effort: that list is sorted
+                // independently, so it only lines up when the two orders happen to agree.
+                cmbDongle.SelectedIndexChanged -= cmbDongle_SelectedIndexChanged;
+                cmbDongle.Items.Clear();
+                if (hids.Count == 0)
                 {
-                    lblDongleDetected.ForeColor = System.Drawing.Color.DarkOrange;
-                    lblDongleDetected.Text += "  ⚠ index exceeds the number of dongles found.";
+                    cmbDongle.Items.Add(DongleOption.FirstFound());
+                }
+                else
+                {
+                    for (int i = 0; i < hids.Count; i++)
+                    {
+                        cmbDongle.Items.Add(new DongleOption
+                        {
+                            Index = i,
+                            Hid = hids[i],
+                            UsbInstanceId = i < usb.Count ? usb[i] : null
+                        });
+                    }
+                }
+
+                // Restore the previous selection by HID if that dongle is still present; else pick #0.
+                int restore = 0;
+                if (previousHid.HasValue)
+                {
+                    for (int i = 0; i < cmbDongle.Items.Count; i++)
+                    {
+                        if (cmbDongle.Items[i] is DongleOption o && o.Hid == previousHid)
+                        {
+                            restore = i;
+                            break;
+                        }
+                    }
+                }
+                cmbDongle.SelectedIndexChanged += cmbDongle_SelectedIndexChanged;
+                cmbDongle.SelectedIndex = restore; // fires the handler -> updates the shared selection
+
+                // Capture the hub for the now-selected dongle (off the UI thread - spawns powershell).
+                await Task.Run(() => CaptureDongleHubChain());
+
+                if (hids.Count > 0)
+                {
+                    lblDongleDetected.ForeColor = System.Drawing.Color.Black;
+                    lblDongleDetected.Text =
+                        $"Found {hids.Count} dongle(s); Windows sees {usb.Count} USB device(s). Pick one on the left.";
+                }
+                else
+                {
+                    lblDongleDetected.ForeColor = usb.Count > 0
+                        ? System.Drawing.Color.DarkOrange
+                        : System.Drawing.Color.Red;
+                    lblDongleDetected.Text = usb.Count > 0
+                        ? $"SDK found no dongles, but Windows sees {usb.Count} USB device(s). Check the dongle params / drivers."
+                        : "No dongles found. Is one plugged in?";
                 }
             }
             catch (Exception ex)
@@ -1150,6 +1509,40 @@ try {
             }
             finally
             {
+                btnDetectDongles.Enabled = true;
+            }
+        }
+
+        // Runs a reset on demand so you can confirm recovery works without waiting for a wedge.
+        private async Task ManualResetAsync(int level)
+        {
+            if (_cancellationTokenSource != null)
+            {
+                MessageBox.Show("A test is running. Stop it before resetting the dongle manually.",
+                    "Reset", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            btnResetL1.Enabled = false;
+            btnResetL2.Enabled = false;
+            btnDetectDongles.Enabled = false;
+            try
+            {
+                // Target this instance's dongle (falls back to VID/PID match if not resolvable).
+                // GetPhysicalDongleInstanceIds spawns powershell.exe, so run it off the UI thread.
+                int resetIndex = CurrentDongleSelection().Index;
+                await Task.Run(() => ResolveSelectedDongle(GetPhysicalDongleInstanceIds(), resetIndex));
+                txtResults.AppendText($"— Manual reset (level {level}) —\r\n");
+                bool ok = await ResetUsbDongleAsync(level);
+                txtResults.AppendText(ok
+                    ? "   ✓ Reset command completed. Check whether the dongle now responds.\r\n"
+                    : "   ✗ Reset command did not complete successfully (see messages above).\r\n");
+                txtResults.ScrollToCaret();
+            }
+            finally
+            {
+                btnResetL1.Enabled = true;
+                btnResetL2.Enabled = true;
                 btnDetectDongles.Enabled = true;
             }
         }
@@ -1437,8 +1830,18 @@ try {
             int yieldInterval = _speedMode == SpeedMode.Fast ? 50 : _speedMode == SpeedMode.Balanced ? 100 : 200;
             int consecutiveSeedErrors = 0;
 
-            foreach (string seed in seeds)
+            // If this call is a re-run after an auto-recovery, skip the seeds already tested so we
+            // don't re-test (and re-log) them.
+            int startFrom = 0;
+            if (!string.IsNullOrEmpty(_lastTestedSeed))
             {
+                int li = seeds.FindLastIndex(s => string.Equals(s, _lastTestedSeed, StringComparison.Ordinal));
+                if (li >= 0) startFrom = li + 1;
+            }
+
+            for (int seedIdx = startFrom; seedIdx < seeds.Count; seedIdx++)
+            {
+                string seed = seeds[seedIdx];
                 if (cancellationToken.IsCancellationRequested)
                     break;
 
@@ -1563,7 +1966,18 @@ try {
             int yieldInterval = _speedMode == SpeedMode.Fast ? 50 : _speedMode == SpeedMode.Balanced ? 100 : 200;
             int consecutiveSeedErrors = 0;
 
-            foreach (string seed in GenerateCombinations(charset, length, limit, startIndex))
+            // If this is a re-run after an auto-recovery, resume just past the last tested seed so we
+            // don't re-test (and re-log) combinations already done.
+            long effectiveStart = startIndex;
+            if (!string.IsNullOrEmpty(_lastTestedSeed)
+                && TryGetCombinationIndex(_lastTestedSeed, charset, length, out long lastIdx)
+                && lastIdx + 1 > effectiveStart)
+            {
+                effectiveStart = lastIdx + 1;
+            }
+            skipped = effectiveStart;
+
+            foreach (string seed in GenerateCombinations(charset, length, limit, effectiveStart))
             {
                 if (cancellationToken.IsCancellationRequested)
                     break;
