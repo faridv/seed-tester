@@ -4,6 +4,42 @@
 
 A C# Windows Forms application that tests a list of seeds against a **Rockey4 Smart** dongle and logs all generated passwords to a CSV file.
 
+## How recovery, multi-dongle and repair work (2026 rewrite)
+
+Three long-standing pain points were reworked:
+
+### 1. Safe self-healing when a dongle wedges
+When a Rockey dongle stops responding it keeps its Windows device node but goes to a
+non-`OK` status. Recovery now **disables + re-enables only that dongle's own PnP node**
+(`USB\VID_096E&PID_0006\...`). It **never power-cycles a USB hub**, so it can no longer take
+down the keyboard, Bluetooth, mouse or other devices (the old code cycled the parent hub,
+which on this machine is the USB 3.0 *root hub* — that is what broke unrelated devices and
+forced driver reinstalls).
+
+The recovery ladder, per wedge, is: a couple of immediate retries → close/re-open the SDK
+handle → a safe device-node reset. A run only stops a dongle if the whole ladder fails, and
+**only that one dongle stops — the others keep going.** This is why overnight runs no longer
+need a human to unplug/replug. There is also a **"Reset Wedged Dongle (safe)"** button to do
+the device-only reset on demand.
+
+### 2. Multiple dongles in ONE app instance (parallel)
+Running two copies of the app fought over the driver. Instead, click **Detect Dongles**; every
+checked dongle now runs **in parallel on its own thread inside a single instance**. The overall
+seed range (brute-force) or seed file (dictionary) is **split evenly across the dongles**, and
+**each dongle writes its own log file** (`password_log.d0.csv`, `password_log.d1.csv`, …) so
+there is no write contention and each resumes independently. A single dongle keeps writing to the
+exact filename you chose (backward compatible). If you ever see corrupt output from running
+several dongles at once, tick **"Serialize dongle I/O"** to force one SDK call at a time.
+
+### 3. "Fix Missing (Repair)" — fill gaps and error rows in huge logs
+A third mode button beside Dictionary / Brute-Force. Point it at a log file (e.g.
+`11111111_22222222.csv`; the range is read from the filename or you can type Start/Stop), and it
+**streams the whole file in one pass (~200 MB/s, so ~2 min for 23 GB)** to find every seed that
+has no valid password — both **error/`N/A` rows** and **gaps** (seeds never logged). It then
+re-tests just those seeds (across all dongles) and writes the results to a **separate
+`…​.repaired.csv`** next to the original, so the giant source file is never rewritten. Re-running
+Repair skips seeds already fixed in a previous `.repaired.csv`.
+
 ## Key Features
 
 ### ✅ Rockey4 Smart Support
@@ -228,8 +264,13 @@ Seed,Password,Word1,Word2,Word3,Word4,Status,Timestamp
 | 1 | Dongle not found | Check USB connection |
 | 2 | Invalid parameters | Verify P1-P4 values |
 | 3 | Dongle in use | Close other applications |
-| 13 | Error in generating seed | unplug and replug dongle |
-| 255 | Communication error | Reconnect dongle |
+| 13 | Error in generating seed | Handled automatically now — the app retries, reopens the handle, then does a safe device-only reset. Only replug manually if the app reports that dongle gave up. |
+| 255 | Communication error | Same automatic recovery as code 13. |
+
+> **Note:** You rarely need to unplug/replug anymore. When a dongle stops responding the app
+> self-heals (retry → reopen → safe reset of that dongle's own USB node) and only that dongle
+> pauses if recovery fails — the others keep running. Any seeds it couldn't get can be filled in
+> afterwards with **Fix Missing (Repair)**.
 
 ### CSV File Empty
 

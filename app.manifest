@@ -4,10 +4,11 @@
 
   <!--
     The app requires administrator rights so it can programmatically disable/enable
-    (virtually unplug/replug) the Rockey USB dongle when it wedges. Disable-PnpDevice /
-    Enable-PnpDevice fail silently without elevation, which is why the auto-reset never
-    worked before. Requesting admin here means a single UAC prompt at launch and lets
-    unattended overnight runs recover on their own.
+    (virtually unplug/replug) the Rockey dongle's OWN USB device node when it wedges.
+    Disable-PnpDevice / Enable-PnpDevice fail silently without elevation. Recovery is now
+    strictly device-scoped (limited to USB\VID_096E&PID_0006), so it can NEVER cycle a USB
+    hub and can never disturb the keyboard, Bluetooth or other devices - unlike the old
+    hub power-cycle. A single UAC prompt at launch lets unattended overnight runs self-heal.
   -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
