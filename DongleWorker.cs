@@ -75,13 +75,18 @@ namespace RockeyPasswordTester
             public int Index;                    // display index / dongle number
             public uint? TargetHid;              // SDK hardware id to bind to (robust to enumeration order)
             public string? UsbInstanceId;        // Windows PnP instance id for a targeted reset
+            public string PortLabel = "port unknown"; // physical USB port, for "which dongle to replug"
             public ushort P1, P2, P3, P4;        // dongle parameters
             public string TargetPassword = string.Empty;
             public SpeedMode Speed = SpeedMode.Balanced;
             public SeedSource Source = null!;
-            public string LogPath = string.Empty;
-            public object SdkGate = null!;        // serialises FIND/OPEN/CLOSE across workers
-            public bool SerializeSeedCalls;       // also serialise RY_SEED (fallback if the SDK isn't re-entrant)
+            public string LogPath = string.Empty;      // own log file (per-dongle mode); ignored if SharedLog set
+            public LogSink? SharedLog;                  // when set, all workers write to this one file
+            // Shared arbiter: RY_SEED takes the READ lock (dongles seed concurrently); FIND/OPEN/CLOSE
+            // take the WRITE lock, which briefly pauses every other dongle's seeding so a recovery on
+            // one dongle can't knock the others offline (the cascade we saw in the logs).
+            public ReaderWriterLockSlim SdkLock = null!;
+            public bool SerializeSeedCalls;       // make RY_SEED exclusive too (kills concurrency; use if concurrent seeds corrupt)
             public bool AllowHubCycle;            // opt-in: last-resort power-cycle of the dongle's parent hub
             public bool IsRepair;
             public Action<string> Log = _ => { };
@@ -111,6 +116,12 @@ namespace RockeyPasswordTester
         public string? MatchPassword { get; private set; }
         public int Index => _cfg.Index;
 
+        // Physical identity for "which dongle do I replug?" messages.
+        public string Identity => PhysId;
+        private string PhysId => _cfg.TargetHid.HasValue
+            ? $"dongle #{_cfg.Index} [{_cfg.PortLabel}, HID 0x{_cfg.TargetHid.Value:X8}]"
+            : $"dongle #{_cfg.Index} [{_cfg.PortLabel}]";
+
         // Created inside Run() on the worker's OWN STA thread. The native Rockey SDK object has
         // thread affinity (it expects to be created and called on one STA apartment); constructing it
         // on the UI thread and calling it here would make RY_FIND/RY_OPEN fail.
@@ -121,8 +132,6 @@ namespace RockeyPasswordTester
         private uint _lastGoodSeed = 0x11111111;               // a seed known to work, used to probe after recovery
         private readonly byte[] _buffer = new byte[1024];
 
-        private string? _hubInstanceId;      // dongle's parent hub, captured while healthy (opt-in)
-        private bool _hubCaptureAttempted;
 
         private StreamWriter? _writer;
         private readonly StringBuilder _logBuffer = new StringBuilder();
@@ -144,8 +153,10 @@ namespace RockeyPasswordTester
             try
             {
                 // Must be created on THIS STA thread (see field comment), not in the constructor.
-                // Gated so several workers starting at once don't race the SDK's one-time native init.
-                lock (_cfg.SdkGate) { _r4s = new Rockey4SmartClass.Rockey4Smart(); }
+                // Exclusive so several workers starting at once don't race the SDK's one-time native init.
+                _cfg.SdkLock.EnterWriteLock();
+                try { _r4s = new Rockey4SmartClass.Rockey4Smart(); }
+                finally { _cfg.SdkLock.ExitWriteLock(); }
 
                 OpenLog();
 
@@ -155,12 +166,11 @@ namespace RockeyPasswordTester
                     Failed = true;
                     FailReason = "could not open the dongle";
                     _status = "Failed: dongle not opened";
-                    _cfg.Log($"[Dongle {_cfg.Index}] Could not open the dongle after retries. This dongle is stopped; others continue.");
+                    _cfg.Log($"[Dongle {_cfg.Index}] Could not open {PhysId} after retries. UNPLUG & REPLUG that dongle. This one is stopped; others continue.");
                     return;
                 }
 
-                _cfg.Log($"[Dongle {_cfg.Index}] Connected (handle 0x{_handle:X4}). Testing...");
-                CaptureHubIfNeeded(); // arm the opt-in hub power-cycle while the dongle is healthy
+                _cfg.Log($"[Dongle {_cfg.Index}] Connected: {PhysId} (handle 0x{_handle:X4}). Testing...");
                 _status = "Testing";
                 RunLoop();
 
@@ -182,6 +192,12 @@ namespace RockeyPasswordTester
                 FlushLog();
                 try { _writer?.Dispose(); } catch { }
                 _writer = null;
+                // Release the native SDK object too. A lingering open handle/session keeps the dongle
+                // "in use", which makes a subsequent device reset a no-op - the reason a reset only
+                // worked after the whole app was closed. Dropping + finalizing this lets an in-app
+                // reset actually take.
+                try { (_r4s as IDisposable)?.Dispose(); } catch { }
+                _r4s = null!;
             }
         }
 
@@ -242,7 +258,7 @@ namespace RockeyPasswordTester
                 Failed = true;
                 FailReason = _handleOpen ? "dongle still not generating passwords after recovery" : "dongle did not come back";
                 string tip = _cfg.AllowHubCycle ? "" : " Tip: if this dongle is on a dedicated USB hub, enable 'Hub power-cycle on wedge'.";
-                _cfg.Log($"[Dongle {_cfg.Index}] Could not recover this dongle. Stopping it only (others keep running). Replug it to resume from {seed}.{tip}");
+                _cfg.Log($"[Dongle {_cfg.Index}] Could not recover — UNPLUG & REPLUG {PhysId}. Stopping it only (others keep running). Resume point: {seed}.{tip}");
                 break;
             }
 
@@ -295,12 +311,17 @@ namespace RockeyPasswordTester
             p1 = _chainP1; p2 = _chainP2; p3 = _chainP3; p4 = _chainP4;
             ushort handle = _handle;
 
-            if (_cfg.SerializeSeedCalls)
+            // Concurrent seeds hold the read lock; a recovery/open (write lock) will pause them.
+            bool exclusive = _cfg.SerializeSeedCalls;
+            if (exclusive) _cfg.SdkLock.EnterWriteLock(); else _cfg.SdkLock.EnterReadLock();
+            try
             {
-                lock (_cfg.SdkGate)
-                    return _r4s.Rockey(RY_SEED, ref handle, ref lp1, ref lp2, ref p1, ref p2, ref p3, ref p4, _buffer);
+                return _r4s.Rockey(RY_SEED, ref handle, ref lp1, ref lp2, ref p1, ref p2, ref p3, ref p4, _buffer);
             }
-            return _r4s.Rockey(RY_SEED, ref handle, ref lp1, ref lp2, ref p1, ref p2, ref p3, ref p4, _buffer);
+            finally
+            {
+                if (exclusive) _cfg.SdkLock.ExitWriteLock(); else _cfg.SdkLock.ExitReadLock();
+            }
         }
 
         // The escalating recovery ladder. Each round reopens (soft), or resets the device node, or
@@ -310,37 +331,22 @@ namespace RockeyPasswordTester
         // as the probe succeeds; false when the whole ladder is exhausted.
         private bool RecoverDongle()
         {
-            bool canHub = _cfg.AllowHubCycle && !string.IsNullOrEmpty(_hubInstanceId);
-            int hubRounds = canHub ? HUB_CYCLE_ROUNDS : 0;
-            int totalRounds = SOFT_REOPEN_ROUNDS + DEVICE_RESET_ROUNDS + hubRounds;
-
-            for (int round = 0; round < totalRounds; round++)
+            // Auto-recovery is SOFT ONLY: close and re-open the SDK handle. It NEVER disables a device
+            // or power-cycles a hub. Automatic Disable/Enable-PnpDevice was what kept stranding dongles
+            // in a Disabled state (Enable can fail with "Generic failure"), which then blocked the SDK
+            // for ALL dongles and forced a Windows restart. A hard wedge that a reopen can't fix is
+            // reported for a physical replug instead. (The Reset / Cycle-Hub buttons remain for the user
+            // to invoke deliberately.)
+            for (int round = 0; round < SOFT_REOPEN_ROUNDS + 1; round++)
             {
                 if (_ct.IsCancellationRequested) return false;
-
-                bool opened;
-                if (round < SOFT_REOPEN_ROUNDS)
-                {
-                    _cfg.Log($"[Dongle {_cfg.Index}] Recovery {round + 1}/{totalRounds}: reopening the dongle...");
-                    opened = SoftReopen();
-                }
-                else if (round < SOFT_REOPEN_ROUNDS + DEVICE_RESET_ROUNDS)
-                {
-                    _cfg.Log($"[Dongle {_cfg.Index}] Recovery {round + 1}/{totalRounds}: safe device reset (dongle node only)...");
-                    opened = DeviceResetAndReopen();
-                }
-                else
-                {
-                    _cfg.Log($"[Dongle {_cfg.Index}] Recovery {round + 1}/{totalRounds}: hub power-cycle (re-powers the dongle's port)...");
-                    opened = HubCycleAndReopen();
-                }
-
+                _cfg.Log($"[Dongle {_cfg.Index}] Recovery {round + 1}/{SOFT_REOPEN_ROUNDS + 1}: reopening the dongle...");
+                bool opened = SoftReopen();
                 if (_ct.IsCancellationRequested) return false;
-                if (!opened) continue; // couldn't reopen this round -> escalate to a stronger one
+                if (!opened) continue;
 
                 ushort rc = DoSeed(_lastGoodSeed, out _, out _, out _, out _); // health probe (not logged)
                 if (rc == 0) return true; // dongle is generating passwords again
-                // Reopened but still not answering -> escalate.
             }
             return false;
         }
@@ -352,82 +358,15 @@ namespace RockeyPasswordTester
             return OpenOnce();
         }
 
-        private bool DeviceResetAndReopen()
-        {
-            CloseHandle();
-            try
-            {
-                var targets = UsbReset.ChooseResetTargets(_cfg.UsbInstanceId);
-                UsbReset.ResetDevicesAsync(targets, _ct, _cfg.Log).GetAwaiter().GetResult();
-            }
-            catch (OperationCanceledException) { return false; }
-            catch (Exception ex) { _cfg.Log($"[Dongle {_cfg.Index}] Reset error: {ex.Message}"); }
-
-            if (WaitCancellable(DEVICE_RESET_WAIT_MS)) return false;
-            return OpenOnce();
-        }
-
-        private bool HubCycleAndReopen()
-        {
-            CloseHandle();
-            try { UsbReset.CycleHubAsync(_hubInstanceId!, _ct, _cfg.Log).GetAwaiter().GetResult(); }
-            catch (OperationCanceledException) { return false; }
-            catch (Exception ex) { _cfg.Log($"[Dongle {_cfg.Index}] Hub cycle error: {ex.Message}"); }
-            if (WaitCancellable(DEVICE_RESET_WAIT_MS)) return false;
-            return OpenOnce();
-        }
-
-        // Records the dongle's immediate parent hub (while it is healthy) so a last-resort hub
-        // power-cycle can re-power its port even after a hard wedge drops it off the bus. Only runs
-        // when the user opted into hub-cycle recovery. Refuses root hubs (handled in UsbReset).
-        private void CaptureHubIfNeeded()
-        {
-            if (!_cfg.AllowHubCycle || _hubCaptureAttempted) return;
-            _hubCaptureAttempted = true;
-            try
-            {
-                string? myId = _cfg.UsbInstanceId;
-                if (string.IsNullOrEmpty(myId))
-                {
-                    var present = UsbReset.GetPresentRockeyDevices();
-                    if (present.Count == 1) myId = present[0].InstanceId;
-                    else
-                    {
-                        // Several nodes present (e.g. a leftover interface): the one we just opened is
-                        // the healthy (OK) one.
-                        var healthy = present.Where(p => p.IsHealthy).ToList();
-                        if (healthy.Count == 1) myId = healthy[0].InstanceId;
-                    }
-                }
-                if (string.IsNullOrEmpty(myId))
-                {
-                    _cfg.Log($"[Dongle {_cfg.Index}] Hub-cycle on: couldn't pin this dongle's USB node (multiple present, no Detect). A hard wedge will need a manual replug.");
-                    return;
-                }
-                _hubInstanceId = UsbReset.GetCyclableParentHub(myId);
-                if (_hubInstanceId == null)
-                {
-                    _cfg.Log($"[Dongle {_cfg.Index}] Hub-cycle on, but this dongle sits on a ROOT hub (or the hub is unknown) — refusing to cycle it. A hard wedge will need a manual replug. Tip: move the dongle onto a small dedicated USB hub.");
-                    return;
-                }
-                var kids = UsbReset.DescribeHubChildren(_hubInstanceId);
-                _cfg.Log($"[Dongle {_cfg.Index}] Hub-cycle armed on {_hubInstanceId}. A cycle briefly disconnects everything on that hub:");
-                if (kids.Count == 0) _cfg.Log("     (only this dongle appears to be on it)");
-                else foreach (var k in kids) _cfg.Log("     - " + k);
-            }
-            catch (Exception ex) { _cfg.Log($"[Dongle {_cfg.Index}] Hub capture error: {ex.Message}"); }
-        }
-
-        // Initial open, with the same escalation as mid-run recovery so a run can start even if the
-        // dongle happens to be wedged when Start is pressed.
+        // Initial open, with a couple of soft retries so a run can start through a transient blip.
+        // Soft only - never disables the device (see RecoverDongle).
         private bool EnsureOpenWithRecovery()
         {
             if (OpenOnce()) return true;
-            for (int round = 0; round < SOFT_REOPEN_ROUNDS + DEVICE_RESET_ROUNDS; round++)
+            for (int round = 0; round < SOFT_REOPEN_ROUNDS; round++)
             {
                 if (_ct.IsCancellationRequested) return false;
-                bool opened = round < SOFT_REOPEN_ROUNDS ? SoftReopen() : DeviceResetAndReopen();
-                if (opened) return true;
+                if (SoftReopen()) return true;
             }
             return false;
         }
@@ -436,7 +375,8 @@ namespace RockeyPasswordTester
         // the shared SDK gate because the native FIND cursor is process-global.
         private bool OpenOnce()
         {
-            lock (_cfg.SdkGate)
+            _cfg.SdkLock.EnterWriteLock(); // exclusive: pauses other dongles' seeding during FIND/OPEN
+            try
             {
                 try
                 {
@@ -498,12 +438,14 @@ namespace RockeyPasswordTester
                     return false;
                 }
             }
+            finally { _cfg.SdkLock.ExitWriteLock(); }
         }
 
         private void CloseHandle()
         {
             if (!_handleOpen) return;
-            lock (_cfg.SdkGate)
+            _cfg.SdkLock.EnterWriteLock();
+            try
             {
                 try
                 {
@@ -514,6 +456,7 @@ namespace RockeyPasswordTester
                 catch { }
                 _handleOpen = false;
             }
+            finally { _cfg.SdkLock.ExitWriteLock(); }
         }
 
         private void WaitWhilePaused()
@@ -529,6 +472,10 @@ namespace RockeyPasswordTester
 
         private void OpenLog()
         {
+            // Shared-log mode: all workers write to the one LogSink (opened by the form) - nothing to
+            // open here. Per-dongle mode: open this worker's own file.
+            if (_cfg.SharedLog != null) { _flushedFirst = true; return; }
+
             bool existed = File.Exists(_cfg.LogPath) && new FileInfo(_cfg.LogPath).Length > 0;
             _writer = new StreamWriter(new FileStream(_cfg.LogPath, FileMode.Append, FileAccess.Write, FileShare.Read), Encoding.UTF8);
             if (!existed)
@@ -550,11 +497,19 @@ namespace RockeyPasswordTester
 
         private void FlushLog()
         {
-            if (_logBuffer.Length == 0 || _writer == null) return;
+            if (_logBuffer.Length == 0) return;
             try
             {
-                _writer.Write(_logBuffer.ToString());
-                _writer.Flush();
+                if (_cfg.SharedLog != null)
+                {
+                    _cfg.SharedLog.WriteBlock(_logBuffer.ToString());
+                }
+                else
+                {
+                    if (_writer == null) return;
+                    _writer.Write(_logBuffer.ToString());
+                    _writer.Flush();
+                }
                 _logBuffer.Clear();
                 _bufferedLines = 0;
                 _flushedFirst = true;

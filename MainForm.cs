@@ -21,7 +21,10 @@ namespace RockeyPasswordTester
 
         private CancellationTokenSource? _cts;
         private readonly List<DongleWorker> _workers = new List<DongleWorker>();
-        private readonly object _sdkGate = new object();
+        // Concurrent RY_SEED (read lock) but exclusive FIND/OPEN/CLOSE (write lock), so one dongle's
+        // recovery can't knock the others offline mid-seed.
+        private readonly ReaderWriterLockSlim _sdkLock = new ReaderWriterLockSlim();
+        private LogSink? _sharedLog;
 
         private Stopwatch _sw = new Stopwatch();
         private SpeedMode _speedMode = SpeedMode.Balanced;
@@ -32,6 +35,8 @@ namespace RockeyPasswordTester
         private long _uiTotal;
         private readonly object _uiTotalLock = new object();
         private DongleWorker? _matchedWorker;
+        // Running totals from auto-recovery cycles already finished (each cycle uses fresh workers).
+        private long _baseTested, _baseGenerated, _baseVerified;
 
         // Multi-dongle / repair controls, built in code so the generated Designer layout is untouched.
         private GroupBox grpMultiDongle = null!;
@@ -42,10 +47,12 @@ namespace RockeyPasswordTester
         private TextBox txtStopSeed = null!;
         private CheckBox chkSerialize = null!;
         private CheckBox chkHubRecover = null!;
+        private CheckBox chkPerDongleLog = null!;
         private Button btnResetSafe = null!;
         private Button btnCycleHub = null!;
         private Label lblMultiHint = null!;
         private Button btnModeRepair = null!;
+        private CheckBox chkDemo = null!;
 
         // One entry in the dongle picker. Index is the SDK enumeration position; Hid binds to the
         // exact dongle regardless of order; UsbInstanceId (best-effort) pairs it with a Windows device
@@ -55,19 +62,89 @@ namespace RockeyPasswordTester
             public int Index { get; init; }
             public uint? Hid { get; init; }
             public string? UsbInstanceId { get; init; }
+            public string? Location { get; init; } // physical port, e.g. "Port_#0004.Hub_#0004"
             public static DongleOption FirstFound() => new DongleOption { Index = 0, Hid = null };
+            public string PortLabel => string.IsNullOrEmpty(Location) ? "port unknown" : Location!;
             public override string ToString() =>
-                Hid.HasValue ? $"Dongle #{Index} — HID 0x{Hid.Value:X8}" : "Dongle #0 (first found)";
+                Hid.HasValue
+                    ? $"Dongle #{Index} — {PortLabel} — HID 0x{Hid.Value:X8}"
+                    : "Dongle #0 (first found)";
         }
 
-        public MainForm()
+        private readonly bool _resumedLaunch;
+
+        public MainForm() : this(false) { }
+
+        public MainForm(bool resumed)
         {
+            _resumedLaunch = resumed;
+            // A fresh, user-initiated launch clears any leftover auto-restart state (resets the loop
+            // guard and drops stale auto-resume settings). A --resumed launch keeps it to continue.
+            if (!resumed) { try { if (File.Exists(RunStatePath)) File.Delete(RunStatePath); } catch { } }
             InitializeComponent();
             _uiTimer = new System.Windows.Forms.Timer { Interval = 1000 };
             _uiTimer.Tick += UiTimer_Tick;
             UiTotal = 0;
+            AddDemoCheckbox();
             BuildMultiDongleUi();
             SetMode(TestMode.Dictionary); // initial styling + enabled state
+            // Self-heal: a previous run's interrupted reset can leave a dongle Disabled in Windows,
+            // and it never comes back on its own. Re-enable any such dongle at startup (off the UI
+            // thread - it spawns powershell). The app is elevated (manifest) so Enable-PnpDevice works.
+            Task.Run(() => UsbReset.EnableDisabledRockeyDevices(AppendResult));
+            Shown += MainForm_Shown;
+        }
+
+        private async void MainForm_Shown(object? sender, EventArgs e)
+        {
+            Shown -= MainForm_Shown;
+            if (!_resumedLaunch) return;
+            // We are the fresh process spawned by an auto-recovery restart. Reload the run settings,
+            // reset the dongles from this clean process (no stale handles), then continue the run.
+            try
+            {
+                if (!LoadRunState()) { AppendResult("Auto-restart: no saved run state; idle."); return; }
+                AppendResult("Auto-restarted after a wedge. Resetting dongles and resuming shortly...");
+                await Task.Delay(2500); // let the previous process fully exit and release its handles
+                await Task.Run(() => UsbReset.EnableDisabledRockeyDevices(AppendResult));
+                using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60)))
+                    await UsbReset.ResetDevicesAsync(UsbReset.GetPresentInstanceIds(), cts.Token, AppendResult);
+                await Task.Delay(4000);
+                await DetectDonglesAsync();          // enumerate the now-clean dongles
+                if (!btnTest.Enabled) return;         // a run somehow already active
+                btnTest_Click(btnTest, EventArgs.Empty); // auto-continue (resumes from the log)
+            }
+            catch (Exception ex) { AppendResult("Auto-restart error: " + ex.Message); }
+        }
+
+        // Default dongle parameters and the "Demo" set, kept in one place.
+        private static readonly (string P1, string P2, string P3, string P4) DefaultParams = ("530A", "00FC", "CB51", "8C4E");
+        private static readonly (string P1, string P2, string P3, string P4) DemoParams = ("C44C", "C8F8", "CB51", "8C4E");
+
+        // Adds a "Demo" checkbox under the P1-P4 inputs. Checked fills them with the demo password
+        // C44C C8F8 CB51 8C4E; unchecked restores the defaults. The P1-P4 group is grown a little and
+        // everything below it nudged down so nothing overlaps.
+        private void AddDemoCheckbox()
+        {
+            const int delta = 26;
+            int threshold = grpMode.Top; // shift this row and everything below it
+
+            grpDongleParams.Height += delta;
+            chkDemo = new CheckBox { Text = "Demo", AutoSize = true, Location = new Point(10, 90) };
+            var tt = new ToolTip();
+            tt.SetToolTip(chkDemo, "Fill P1-P4 with the demo values C44C C8F8 CB51 8C4E. Uncheck to restore the defaults (530A 00FC CB51 8C4E).");
+            chkDemo.CheckedChanged += chkDemo_CheckedChanged;
+            grpDongleParams.Controls.Add(chkDemo);
+
+            foreach (Control ctl in Controls)
+                if (ctl.Top >= threshold) ctl.Top += delta;
+            ClientSize = new Size(ClientSize.Width, ClientSize.Height + delta);
+        }
+
+        private void chkDemo_CheckedChanged(object? sender, EventArgs e)
+        {
+            var p = chkDemo.Checked ? DemoParams : DefaultParams;
+            txtP1.Text = p.P1; txtP2.Text = p.P2; txtP3.Text = p.P3; txtP4.Text = p.P4;
         }
 
         private long UiTotal
@@ -80,7 +157,7 @@ namespace RockeyPasswordTester
 
         private void BuildMultiDongleUi()
         {
-            const int groupTop = 724; // where grpResults currently sits
+            int groupTop = grpResults.Location.Y; // where grpResults currently sits (after any earlier shifts)
             const int groupHeight = 152;
             const int shift = groupHeight + 8;
 
@@ -107,6 +184,11 @@ namespace RockeyPasswordTester
 
             btnDetectDongles = new Button { Text = "Detect Dongles", Location = new Point(332, 22), Size = new Size(120, 26) };
             btnDetectDongles.Click += btnDetectDongles_Click;
+
+            chkPerDongleLog = new CheckBox { Text = "Separate log per dongle", AutoSize = true, Location = new Point(462, 26) };
+            toolTip.SetToolTip(chkPerDongleLog,
+                "Unchecked (default): all dongles work ONE range and write ONE shared log, continuing from that file's last seed. " +
+                "Checked: split the range and give each dongle its own log file (log.d0.csv, log.d1.csv, …), each resuming from its own file.");
 
             lblDongleDetected = new Label
             {
@@ -157,7 +239,7 @@ namespace RockeyPasswordTester
 
             grpMultiDongle.Controls.AddRange(new Control[]
             {
-                lblDongles, clbDongles, btnDetectDongles, lblDongleDetected,
+                lblDongles, clbDongles, btnDetectDongles, chkPerDongleLog, lblDongleDetected,
                 lblStartSeed, txtStartSeed, lblStopSeed, txtStopSeed, chkSerialize, chkHubRecover,
                 lblRecovery, btnResetSafe, btnCycleHub, lblMultiHint
             });
@@ -297,7 +379,8 @@ namespace RockeyPasswordTester
             var ids = new List<uint>();
             try
             {
-                lock (_sdkGate)
+                _sdkLock.EnterWriteLock();
+                try
                 {
                     var r4s = new Rockey4SmartClass.Rockey4Smart();
                     ushort handle = 0; uint lp1 = 0, lp2 = 0; byte[] buffer = new byte[1024];
@@ -307,16 +390,22 @@ namespace RockeyPasswordTester
                     while (rc == 0 && guard++ < 64)
                     {
                         ids.Add(lp1);
-                        a = p1; b = p2; c = p3; d = p4; lp1 = 0; lp2 = 0;
+                        // Keep handle/lp1/lp2 as RY_FIND left them - RY_FIND_NEXT uses them as the
+                        // enumeration cursor. Zeroing lp1 here made it only ever return the first dongle
+                        // (which is why "Detect" reported 1 when several were connected).
+                        a = p1; b = p2; c = p3; d = p4;
                         rc = r4s.Rockey(RY_FIND_NEXT, ref handle, ref lp1, ref lp2, ref a, ref b, ref c, ref d, buffer);
                     }
                 }
+                finally { _sdkLock.ExitWriteLock(); }
             }
             catch { }
             return ids;
         }
 
-        private async void btnDetectDongles_Click(object? sender, EventArgs e)
+        private async void btnDetectDongles_Click(object? sender, EventArgs e) => await DetectDonglesAsync();
+
+        private async Task DetectDonglesAsync()
         {
             btnDetectDongles.Enabled = false;
             lblDongleDetected.ForeColor = Color.Gray;
@@ -327,7 +416,7 @@ namespace RockeyPasswordTester
 
                 List<uint> hids = new List<uint>();
                 await RunOnStaThreadAsync(() => { hids = EnumerateSdkDongles(p1, p2, p3, p4); });
-                List<string> usb = await Task.Run(() => UsbReset.GetPresentInstanceIds());
+                List<UsbReset.RockeyDevice> usb = await Task.Run(() => UsbReset.GetPresentRockeyDevices());
 
                 clbDongles.Items.Clear();
                 if (hids.Count == 0)
@@ -338,11 +427,14 @@ namespace RockeyPasswordTester
                 {
                     for (int i = 0; i < hids.Count; i++)
                     {
+                        // Best-effort pairing of the SDK dongle with a Windows USB node (both lists
+                        // sorted independently), so we can name a physical port for it.
                         clbDongles.Items.Add(new DongleOption
                         {
                             Index = i,
                             Hid = hids[i],
-                            UsbInstanceId = i < usb.Count ? usb[i] : null
+                            UsbInstanceId = i < usb.Count ? usb[i].InstanceId : null,
+                            Location = i < usb.Count ? usb[i].Location : null
                         }, true); // default: use every detected dongle
                     }
                 }
@@ -356,7 +448,7 @@ namespace RockeyPasswordTester
                 {
                     lblDongleDetected.ForeColor = usb.Count > 0 ? Color.DarkOrange : Color.Red;
                     lblDongleDetected.Text = usb.Count > 0
-                        ? $"SDK found no dongles but Windows sees {usb.Count} USB node(s). Check the P1-P4 params / drivers."
+                        ? $"SDK talked to no dongles, but Windows sees {usb.Count}. They may be wedged — replug them (or reboot) so the SDK can enumerate all {usb.Count}."
                         : "No dongles found. Is one plugged in?";
                 }
             }
@@ -488,6 +580,8 @@ namespace RockeyPasswordTester
             txtLogFile.Text = logFilePath;
             var dongles = GetSelectedDongles();
 
+            _baseTested = _baseGenerated = _baseVerified = 0; // cumulative across auto-recovery cycles
+
             try
             {
                 _sw.Restart();
@@ -528,41 +622,149 @@ namespace RockeyPasswordTester
         private async Task RunTestAsync(List<DongleOption> dongles, ushort p1, ushort p2, ushort p3, ushort p4, string targetPassword, string logFilePath, CancellationToken ct)
         {
             int n = dongles.Count;
+            bool perDongleLogs = chkPerDongleLog.Checked; // false = one shared range + one shared log (default)
+            const int MAX_AUTO_RECOVERIES = 3; // in-process reset attempts before escalating to a full restart
+            int recoveries = 0;
+
+            // Dictionary seeds are loaded once and reused across auto-recovery cycles.
+            List<string>? dictSeeds = null;
+            if (_testMode == TestMode.Dictionary)
+            {
+                lblStatus.Text = "Loading seeds...";
+                dictSeeds = await LoadSeedsAsync(txtSeedListFile.Text);
+                if (dictSeeds.Count == 0) { lblStatus.Text = "No seeds to test."; return; }
+            }
+
+            while (!ct.IsCancellationRequested)
+            {
+                _sharedLog = perDongleLogs ? null : new LogSink(logFilePath);
+                try
+                {
+                    var (configs, grandTotal) = BuildTestConfigs(dongles, n, perDongleLogs, p1, p2, p3, p4, targetPassword, logFilePath, dictSeeds, _sharedLog);
+                    UiTotal = _baseTested + grandTotal;
+                    if (grandTotal == 0)
+                    {
+                        lblStatus.Text = recoveries == 0 ? "Nothing to test — log already covers the range." : "Done — range complete.";
+                        return;
+                    }
+                    lblStatus.Text = $"Running {n} dongle(s) over {grandTotal:N0} seeds...";
+                    await RunConfigsAsync(configs, ct);
+                }
+                finally
+                {
+                    _sharedLog?.Dispose();
+                    _sharedLog = null;
+                }
+
+                if (ct.IsCancellationRequested) break;
+                if (_matchedWorker != null) break;
+                if (!_workers.Any(w => w.Failed)) break; // every dongle finished its work normally
+
+                // A dongle wedged and stopped. The workers have all exited and closed their handles, so
+                // now we do exactly what works by hand: fully release the SDK objects, reset the dongles
+                // (which only takes when nothing holds them open), wait, then resume from the logs.
+                if (++recoveries > MAX_AUTO_RECOVERIES)
+                {
+                    // In-process resets didn't clear it. Escalate to a clean restart of the whole app
+                    // (a fresh process is the only sure way to release a stuck SDK session), which then
+                    // resets and auto-resumes. No UAC prompt (the child inherits this elevated token).
+                    AppendResult($"In-app reset didn't clear the wedge after {MAX_AUTO_RECOVERIES} tries. Restarting the app from a clean state to recover...");
+                    if (RestartSelfForRecovery())
+                    {
+                        _uiTimer.Stop();
+                        await Task.Delay(500); // let the log/UI flush
+                        Environment.Exit(0);   // release this process's stuck handles for the fresh instance
+                    }
+                    break; // guard hit - stop and let the user intervene
+                }
+                string who = string.Join(", ", _workers.Where(w => w.Failed).Select(w => $"#{w.Index}"));
+                AppendResult($"Auto-recovery {recoveries}/{MAX_AUTO_RECOVERIES}: dongle(s) {who} stopped responding. Releasing handles, resetting all dongles, and resuming...");
+                lblStatus.Text = $"Auto-recovery {recoveries}: resetting dongles and resuming...";
+
+                // Carry finished counts forward, then drop the workers and force finalizers so the
+                // native handles are truly released before the reset.
+                _baseTested += _workers.Sum(w => w.Tested);
+                _baseGenerated += _workers.Sum(w => w.Generated);
+                _baseVerified += _workers.Sum(w => w.Verified);
+                ReleaseSdkObjects();
+
+                try
+                {
+                    await UsbReset.ResetDevicesAsync(UsbReset.GetPresentInstanceIds(), ct, AppendResult);
+                    await Task.Delay(6000, ct);
+                }
+                catch (OperationCanceledException) { break; }
+                catch (Exception ex) { AppendResult("   auto-reset error: " + ex.Message); }
+                // loop: rebuild configs (resumes from the logs) and run again
+            }
+        }
+
+        // Frees the finished workers and their native SDK objects so a device reset can take (a
+        // lingering open handle keeps the dongle "in use" - the reason a reset used to need the app
+        // to be closed).
+        private void ReleaseSdkObjects()
+        {
+            _workers.Clear();
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+        }
+
+        // Builds the per-dongle worker configs for one run attempt, computing each dongle's resume
+        // point from the log(s). Returns the configs and the number of seeds still to test.
+        private (List<DongleWorker.Config> configs, long grandTotal) BuildTestConfigs(
+            List<DongleOption> dongles, int n, bool perDongleLogs,
+            ushort p1, ushort p2, ushort p3, ushort p4, string targetPassword, string logFilePath,
+            List<string>? dictSeeds, LogSink? sharedLog)
+        {
             var configs = new List<DongleWorker.Config>();
             long grandTotal = 0;
 
             if (_testMode == TestMode.Dictionary)
             {
-                lblStatus.Text = "Loading seeds...";
-                List<string> seeds = await LoadSeedsAsync(txtSeedListFile.Text);
-                if (seeds.Count == 0) { lblStatus.Text = "No seeds to test."; return; }
-
-                for (int i = 0; i < n; i++)
+                List<string> seeds = dictSeeds ?? new List<string>();
+                if (!perDongleLogs)
                 {
-                    int start = (int)((long)seeds.Count * i / n);
-                    int end = (int)((long)seeds.Count * (i + 1) / n);
-                    string log = DeriveLogPath(logFilePath, i, n);
-                    var slice = seeds.GetRange(start, end - start);
-
-                    // Resume: skip past the last seed already in this dongle's log.
                     int resumeFrom = 0;
-                    string last = SeedUtil.ReadLastLoggedSeed(log);
+                    string last = SeedUtil.ReadLastLoggedSeed(logFilePath);
                     if (!string.IsNullOrEmpty(last))
                     {
-                        int li = slice.FindLastIndex(s => string.Equals(s, last, StringComparison.Ordinal));
+                        int li = seeds.FindLastIndex(s => string.Equals(s, last, StringComparison.Ordinal));
                         if (li >= 0) resumeFrom = li + 1;
                     }
-                    var remaining = resumeFrom < slice.Count ? slice.GetRange(resumeFrom, slice.Count - resumeFrom) : new List<string>();
-                    grandTotal += remaining.Count;
-                    configs.Add(MakeConfig(dongles[i], i, n, p1, p2, p3, p4, targetPassword, log,
-                        SeedSource.FromEnumerable(remaining, shared: false)));
+                    var remaining = resumeFrom < seeds.Count ? seeds.GetRange(resumeFrom, seeds.Count - resumeFrom) : new List<string>();
+                    grandTotal = remaining.Count;
+                    var shared = SeedSource.FromEnumerable(remaining, shared: true);
+                    for (int i = 0; i < n; i++)
+                        configs.Add(MakeConfig(dongles[i], i, n, p1, p2, p3, p4, targetPassword, logFilePath, shared, sharedLog));
+                }
+                else
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        int start = (int)((long)seeds.Count * i / n);
+                        int end = (int)((long)seeds.Count * (i + 1) / n);
+                        string log = DeriveLogPath(logFilePath, i, n);
+                        var slice = seeds.GetRange(start, end - start);
+                        int resumeFrom = 0;
+                        string last = SeedUtil.ReadLastLoggedSeed(log);
+                        if (!string.IsNullOrEmpty(last))
+                        {
+                            int li = slice.FindLastIndex(s => string.Equals(s, last, StringComparison.Ordinal));
+                            if (li >= 0) resumeFrom = li + 1;
+                        }
+                        var remaining = resumeFrom < slice.Count ? slice.GetRange(resumeFrom, slice.Count - resumeFrom) : new List<string>();
+                        grandTotal += remaining.Count;
+                        configs.Add(MakeConfig(dongles[i], i, n, p1, p2, p3, p4, targetPassword, log,
+                            SeedSource.FromEnumerable(remaining, shared: false), null));
+                    }
                 }
             }
             else // BruteForce
             {
                 string charset = txtCharset.Text;
                 int length = (int)nudLength.Value;
-                if (string.IsNullOrEmpty(charset)) { lblStatus.Text = "Charset is empty."; return; }
+                if (string.IsNullOrEmpty(charset)) return (configs, 0);
                 long space = (long)Math.Pow(charset.Length, length);
 
                 long rangeStart = 0;
@@ -570,32 +772,42 @@ namespace RockeyPasswordTester
                 long rangeStop = space;
                 if (!string.IsNullOrEmpty(txtStopSeed.Text.Trim()) && SeedUtil.TryGetCombinationIndex(txtStopSeed.Text.Trim(), charset, length, out long sp)) rangeStop = Math.Min(rangeStop, sp);
                 if (chkLimit.Checked) rangeStop = Math.Min(rangeStop, rangeStart + (long)nudLimit.Value);
-                if (rangeStop <= rangeStart) { lblStatus.Text = "Stop seed must be after start seed."; return; }
+                if (rangeStop <= rangeStart) return (configs, 0);
 
-                long total = rangeStop - rangeStart;
-                for (int i = 0; i < n; i++)
+                if (!perDongleLogs)
                 {
-                    long subStart = rangeStart + total * i / n;
-                    long subStop = i == n - 1 ? rangeStop : rangeStart + total * (i + 1) / n;
-                    string log = DeriveLogPath(logFilePath, i, n);
-
-                    long resumeStart = subStart;
-                    string last = SeedUtil.ReadLastLoggedSeed(log);
-                    if (!string.IsNullOrEmpty(last) && SeedUtil.TryGetCombinationIndex(last, charset, length, out long lastIdx))
+                    long resumeStart = rangeStart;
+                    string last = SeedUtil.ReadLastLoggedSeed(logFilePath);
+                    if (!string.IsNullOrEmpty(last) && SeedUtil.TryGetCombinationIndex(last, charset, length, out long lastIdx) && lastIdx + 1 > resumeStart)
+                        resumeStart = Math.Min(lastIdx + 1, rangeStop);
+                    grandTotal = Math.Max(0, rangeStop - resumeStart);
+                    var shared = SeedSource.FromEnumerable(SeedUtil.GenerateCombinations(charset, length, rangeStop, resumeStart), shared: true);
+                    for (int i = 0; i < n; i++)
+                        configs.Add(MakeConfig(dongles[i], i, n, p1, p2, p3, p4, targetPassword, logFilePath, shared, sharedLog));
+                }
+                else
+                {
+                    long total = rangeStop - rangeStart;
+                    for (int i = 0; i < n; i++)
                     {
-                        long next = lastIdx + 1;
-                        if (next > resumeStart && next < subStop) resumeStart = next;
+                        long subStart = rangeStart + total * i / n;
+                        long subStop = i == n - 1 ? rangeStop : rangeStart + total * (i + 1) / n;
+                        string log = DeriveLogPath(logFilePath, i, n);
+                        long resumeStart = subStart;
+                        string last = SeedUtil.ReadLastLoggedSeed(log);
+                        if (!string.IsNullOrEmpty(last) && SeedUtil.TryGetCombinationIndex(last, charset, length, out long lastIdx))
+                        {
+                            long next = lastIdx + 1;
+                            if (next > resumeStart && next < subStop) resumeStart = next;
+                        }
+                        grandTotal += Math.Max(0, subStop - resumeStart);
+                        var seq = SeedUtil.GenerateCombinations(charset, length, subStop, resumeStart);
+                        configs.Add(MakeConfig(dongles[i], i, n, p1, p2, p3, p4, targetPassword, log,
+                            SeedSource.FromEnumerable(seq, shared: false), null));
                     }
-                    grandTotal += Math.Max(0, subStop - resumeStart);
-                    var seq = SeedUtil.GenerateCombinations(charset, length, subStop, resumeStart);
-                    configs.Add(MakeConfig(dongles[i], i, n, p1, p2, p3, p4, targetPassword, log,
-                        SeedSource.FromEnumerable(seq, shared: false)));
                 }
             }
-
-            UiTotal = grandTotal;
-            lblStatus.Text = $"Running {n} dongle(s) over {grandTotal:N0} seeds...";
-            await RunConfigsAsync(configs, ct);
+            return (configs, grandTotal);
         }
 
         // ---- Repair run: scan the huge log, then re-test the missing seeds across N dongles --------
@@ -653,7 +865,7 @@ namespace RockeyPasswordTester
             var configs = new List<DongleWorker.Config>();
             for (int i = 0; i < n; i++)
             {
-                var cfg = MakeConfig(dongles[i], i, n, p1, p2, p3, p4, targetPassword, DeriveRepairPath(logFilePath, i, n), shared);
+                var cfg = MakeConfig(dongles[i], i, n, p1, p2, p3, p4, targetPassword, DeriveRepairPath(logFilePath, i, n), shared, null);
                 cfg.IsRepair = true;
                 configs.Add(cfg);
             }
@@ -668,19 +880,21 @@ namespace RockeyPasswordTester
 
         // ---- Worker orchestration -----------------------------------------------------------------
 
-        private DongleWorker.Config MakeConfig(DongleOption d, int pos, int n, ushort p1, ushort p2, ushort p3, ushort p4, string targetPassword, string logPath, SeedSource source)
+        private DongleWorker.Config MakeConfig(DongleOption d, int pos, int n, ushort p1, ushort p2, ushort p3, ushort p4, string targetPassword, string logPath, SeedSource source, LogSink? sharedLog)
         {
             return new DongleWorker.Config
             {
                 Index = pos,
                 TargetHid = d.Hid,
                 UsbInstanceId = d.UsbInstanceId,
+                PortLabel = d.PortLabel,
                 P1 = p1, P2 = p2, P3 = p3, P4 = p4,
                 TargetPassword = targetPassword,
                 Speed = _speedMode,
                 Source = source,
                 LogPath = logPath,
-                SdkGate = _sdkGate,
+                SharedLog = sharedLog,
+                SdkLock = _sdkLock,
                 SerializeSeedCalls = chkSerialize.Checked,
                 AllowHubCycle = chkHubRecover.Checked,
                 Log = AppendResult,
@@ -699,8 +913,12 @@ namespace RockeyPasswordTester
                 _workers.Add(worker);
                 tasks.Add(RunOnStaThreadAsync(worker.Run));
             }
-            await Task.WhenAll(tasks);
+            _workerTasks = tasks;
+            try { await Task.WhenAll(tasks); }
+            finally { _workerTasks = null; }
         }
+
+        private List<Task>? _workerTasks;
 
         private void OnWorkerMatch(DongleWorker w)
         {
@@ -785,7 +1003,7 @@ namespace RockeyPasswordTester
             lblETA.Text = "N/A";
             txtLastSeed.Text = "";
             lblDongleStatus.Text = "Working...";
-            lblDongleStatus.ForeColor = Color.DarkOrange;
+            lblDongleStatus.ForeColor = Color.Green;
         }
 
         private void UiTimer_Tick(object? sender, EventArgs e)
@@ -793,7 +1011,7 @@ namespace RockeyPasswordTester
             if (_workers.Count == 0) return;
             long total = UiTotal;
 
-            long tested = 0, generated = 0, verified = 0;
+            long tested = _baseTested, generated = _baseGenerated, verified = _baseVerified;
             foreach (var w in _workers) { tested += w.Tested; generated += w.Generated; verified += w.Verified; }
 
             double elapsed = _sw.Elapsed.TotalSeconds;
@@ -840,12 +1058,21 @@ namespace RockeyPasswordTester
                 return;
             }
 
-            long tested = _workers.Sum(w => w.Tested);
-            long verified = _workers.Sum(w => w.Verified);
-            int failed = _workers.Count(w => w.Failed);
+            long tested = _baseTested + _workers.Sum(w => w.Tested);
+            long verified = _baseVerified + _workers.Sum(w => w.Verified);
+            var failedWorkers = _workers.Where(w => w.Failed).ToList();
+            int failed = failedWorkers.Count;
 
             lblDongleStatus.Text = failed == 0 ? "Idle" : $"{failed} dongle(s) stopped";
             lblDongleStatus.ForeColor = failed == 0 ? Color.Gray : Color.Red;
+
+            // Spell out exactly which physical dongle(s) to unplug/replug.
+            if (failed > 0)
+            {
+                AppendResult("");
+                AppendResult($"⚠ {failed} dongle(s) stopped and need a manual unplug/replug:");
+                foreach (var w in failedWorkers) AppendResult($"   → {w.Identity}");
+            }
 
             if (_matchedWorker != null)
             {
@@ -885,9 +1112,136 @@ namespace RockeyPasswordTester
             catch { }
         }
 
+        // ---- Auto-restart recovery (fresh elevated process, no UAC prompt) ------------------------
+        // A brand-new process is the only thing guaranteed to fully release a wedged SDK session (the
+        // reason a reset used to need the app closed by hand). Because THIS process is already elevated,
+        // launching a child inherits the elevated token with no UAC dialog. Run settings are saved so
+        // the child resets the dongles and auto-continues from the logs. A windowed counter stops an
+        // endless restart loop if a dongle is truly dead.
+
+        private static string RunStatePath => Path.Combine(AppContext.BaseDirectory, "run-state.txt");
+
+        private (int restarts, long t0) ReadRestartCounter()
+        {
+            int r = 0; long t = 0;
+            try
+            {
+                if (File.Exists(RunStatePath))
+                    foreach (var line in File.ReadAllLines(RunStatePath))
+                    {
+                        if (line.StartsWith("restarts=")) int.TryParse(line.Substring(9), out r);
+                        else if (line.StartsWith("restartT0=")) long.TryParse(line.Substring(10), out t);
+                    }
+            }
+            catch { }
+            return (r, t);
+        }
+
+        private void SaveRunState(int restarts, long t0)
+        {
+            try
+            {
+                string speed = radSpeedFast.Checked ? "Fast" : radSpeedSlow.Checked ? "Slow" : "Balanced";
+                File.WriteAllLines(RunStatePath, new[]
+                {
+                    "mode=" + _testMode,
+                    "log=" + txtLogFile.Text,
+                    "seedFile=" + txtSeedListFile.Text,
+                    "start=" + txtStartSeed.Text,
+                    "stop=" + txtStopSeed.Text,
+                    "charset=" + txtCharset.Text,
+                    "length=" + (int)nudLength.Value,
+                    "limitOn=" + chkLimit.Checked,
+                    "limit=" + (long)nudLimit.Value,
+                    "target=" + txtTargetPassword.Text,
+                    "p1=" + txtP1.Text, "p2=" + txtP2.Text, "p3=" + txtP3.Text, "p4=" + txtP4.Text,
+                    "speed=" + speed,
+                    "perDongleLog=" + chkPerDongleLog.Checked,
+                    "serialize=" + chkSerialize.Checked,
+                    "restarts=" + restarts,
+                    "restartT0=" + t0,
+                });
+            }
+            catch { }
+        }
+
+        private bool LoadRunState()
+        {
+            try
+            {
+                if (!File.Exists(RunStatePath)) return false;
+                var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var line in File.ReadAllLines(RunStatePath))
+                {
+                    int eq = line.IndexOf('=');
+                    if (eq > 0) d[line.Substring(0, eq)] = line.Substring(eq + 1);
+                }
+                string G(string k) => d.TryGetValue(k, out var v) ? v : "";
+                bool B(string k) => string.Equals(G(k), "True", StringComparison.OrdinalIgnoreCase);
+                if (G("log").Length > 0) txtLogFile.Text = G("log");
+                txtSeedListFile.Text = G("seedFile");
+                txtStartSeed.Text = G("start");
+                txtStopSeed.Text = G("stop");
+                if (G("charset").Length > 0) txtCharset.Text = G("charset");
+                if (int.TryParse(G("length"), out int len)) nudLength.Value = Math.Clamp((decimal)len, nudLength.Minimum, nudLength.Maximum);
+                chkLimit.Checked = B("limitOn");
+                if (long.TryParse(G("limit"), out long lim)) nudLimit.Value = Math.Clamp((decimal)lim, nudLimit.Minimum, nudLimit.Maximum);
+                txtTargetPassword.Text = G("target");
+                if (G("p1").Length > 0) txtP1.Text = G("p1");
+                if (G("p2").Length > 0) txtP2.Text = G("p2");
+                if (G("p3").Length > 0) txtP3.Text = G("p3");
+                if (G("p4").Length > 0) txtP4.Text = G("p4");
+                string sp = G("speed");
+                radSpeedFast.Checked = sp == "Fast"; radSpeedSlow.Checked = sp == "Slow";
+                radSpeedBalanced.Checked = !radSpeedFast.Checked && !radSpeedSlow.Checked;
+                chkPerDongleLog.Checked = B("perDongleLog");
+                chkSerialize.Checked = B("serialize");
+                string m = G("mode");
+                SetMode(m == "BruteForce" ? TestMode.BruteForce : m == "Repair" ? TestMode.Repair : TestMode.Dictionary);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // Launches a fresh elevated copy to recover from a clean state, then this process should exit.
+        // Returns true if the child was launched. A windowed guard prevents an endless restart loop.
+        private bool RestartSelfForRecovery()
+        {
+            const int MAX_RESTARTS = 6;
+            long windowTicks = TimeSpan.FromMinutes(30).Ticks;
+            var (restarts, t0) = ReadRestartCounter();
+            long now = DateTime.UtcNow.Ticks;
+            if (t0 == 0 || now - t0 > windowTicks) { restarts = 0; t0 = now; }
+            if (restarts >= MAX_RESTARTS)
+            {
+                AppendResult($"Auto-restart guard: {MAX_RESTARTS} restarts in 30 min without lasting recovery. Not restarting again — unplug/replug the dongles and click Start.");
+                return false;
+            }
+            string? exe = Environment.ProcessPath;
+            if (string.IsNullOrEmpty(exe)) { AppendResult("Auto-restart: could not resolve the executable path."); return false; }
+            SaveRunState(restarts + 1, t0);
+            try
+            {
+                // UseShellExecute=false: the child inherits this elevated process's token, so no UAC dialog.
+                Process.Start(new ProcessStartInfo { FileName = exe, Arguments = "--resumed", UseShellExecute = false });
+                return true;
+            }
+            catch (Exception ex) { AppendResult("Auto-restart failed to launch: " + ex.Message); return false; }
+        }
+
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             _cts?.Cancel();
+            // Wait for the workers to actually close their dongle handles (RY_CLOSE) before the process
+            // exits. Exiting with a handle still open leaks the driver's "in use" session, which then
+            // blocks every future FIND/OPEN until a device reset or a Windows restart - the exact
+            // "SDK talked to no dongles" wedge. The workers' shutdown does no UI work, so waiting here
+            // can't deadlock.
+            var tasks = _workerTasks;
+            if (tasks != null)
+            {
+                try { Task.WaitAll(tasks.ToArray(), 6000); } catch { }
+            }
             base.OnFormClosing(e);
         }
     }

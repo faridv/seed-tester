@@ -31,6 +31,7 @@ namespace RockeyPasswordTester
         {
             public string InstanceId = string.Empty;
             public string Status = string.Empty; // "OK", "Unknown", "Error", "Degraded", ...
+            public string Location = string.Empty; // e.g. "Port_#0004.Hub_#0004" - the physical port
             public bool IsHealthy => string.Equals(Status, "OK", StringComparison.OrdinalIgnoreCase);
         }
 
@@ -47,14 +48,20 @@ namespace RockeyPasswordTester
             string script =
                 "Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | " +
                 "Where-Object { $_.InstanceId -like '" + EscapePsSingleQuoted(ROCKEY_HARDWARE_ID) + "*' } | " +
-                "Sort-Object InstanceId | ForEach-Object { $_.Status + '|' + $_.InstanceId }";
+                "Sort-Object InstanceId | ForEach-Object { " +
+                "$loc = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_LocationInfo' -ErrorAction SilentlyContinue).Data; " +
+                "$_.Status + '|' + $loc + '|' + $_.InstanceId }";
             foreach (var line in RunPowerShellCaptureLines(script, 10000))
             {
-                int bar = line.IndexOf('|');
-                if (bar <= 0) continue;
-                string status = line.Substring(0, bar).Trim();
-                string id = line.Substring(bar + 1).Trim();
-                if (IsRockeyInstanceId(id)) result.Add(new RockeyDevice { Status = status, InstanceId = id });
+                // status|location|instanceId  (location may be empty)
+                int b1 = line.IndexOf('|');
+                if (b1 <= 0) continue;
+                int b2 = line.IndexOf('|', b1 + 1);
+                if (b2 < 0) continue;
+                string status = line.Substring(0, b1).Trim();
+                string loc = line.Substring(b1 + 1, b2 - b1 - 1).Trim();
+                string id = line.Substring(b2 + 1).Trim();
+                if (IsRockeyInstanceId(id)) result.Add(new RockeyDevice { Status = status, Location = loc, InstanceId = id });
             }
             return result;
         }
@@ -64,6 +71,39 @@ namespace RockeyPasswordTester
                 .Select(d => d.InstanceId)
                 .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
                 .ToList();
+
+        // Re-enables any Rockey dongle node that is currently DISABLED (PnP problem code 22). A reset
+        // (disable+enable, or a hub power-cycle) that was interrupted - the app closed or Stop pressed
+        // between the disable and the enable - leaves the dongle Disabled, and a disabled device never
+        // comes back on its own (not on replug, not on reboot). Called at startup so the app self-heals
+        // from that instead of the user needing an elevated Enable-PnpDevice by hand.
+        public static void EnableDisabledRockeyDevices(Action<string>? log = null)
+        {
+            // Two passes: some dongles refuse to enable on the first try (USB stack busy) but take on a
+            // retry a moment later. Each pass tries Enable-PnpDevice, then pnputil /enable-device.
+            string script = @"
+$ErrorActionPreference='Continue'
+$hw = '" + EscapePsSingleQuoted(ROCKEY_HARDWARE_ID) + @"'
+for($pass=1; $pass -le 2; $pass++){
+    $devs = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like ($hw + '*') }
+    $left = 0
+    foreach($d in $devs){
+        $p = ($d | Get-PnpDeviceProperty -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction SilentlyContinue).Data
+        if($p -eq 22){
+            $done = $false
+            try { Enable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction Stop; $done = $true; Write-Host ('Re-enabled a disabled dongle: ' + $d.InstanceId) }
+            catch {
+                try { & pnputil /enable-device ""$($d.InstanceId)"" | Out-Null; if($LASTEXITCODE -eq 0){ $done = $true; Write-Host ('Re-enabled (pnputil) ' + $d.InstanceId) } } catch {}
+            }
+            if(-not $done){ $left++; if($pass -eq 2){ Write-Host ('Could not re-enable ' + $d.InstanceId + ' - unplug/replug that dongle.') } }
+        }
+    }
+    if($left -eq 0){ break }
+    Start-Sleep -Seconds 2
+}";
+            try { foreach (var line in RunPowerShellCaptureLines(script, 30000)) if (log != null && line.Length > 0) log(line); }
+            catch { }
+        }
 
         // Chooses which dongle node(s) to reset when one wedges. A dongle that has actually dropped
         // to a non-"OK" status is the ground truth for "which one is broken", and that beats the
@@ -145,7 +185,7 @@ foreach ($id in $ids) {
 Start-Sleep -Seconds 3
 if ($allOk) { Write-Host 'Device reset complete'; exit 0 } else { Write-Host 'Device reset incomplete'; exit 3 }";
                 foreach (var id in safe) log("   Resetting dongle node " + id);
-                var (exit, outp, err) = await RunPowerShellAsync(script, 30000, ct).ConfigureAwait(false);
+                var (exit, outp, err) = await RunPowerShellAsync(script, 30000, ct, killOnCancel: false).ConfigureAwait(false);
 
                 string outTrim = outp.Trim();
                 if (outTrim.Length > 0) log("   " + outTrim.Replace("\n", "\n   "));
@@ -220,6 +260,9 @@ if ($allOk) { Write-Host 'Device reset complete'; exit 0 } else { Write-Host 'De
             try
             {
                 string hub = EscapePsSingleQuoted(hubInstanceId);
+                // Keep the hub disabled for a good while: a hung dongle only cold-boots once its port
+                // power/charge has fully drained. A 3s blip often left it enumerating as "USB device not
+                // recognized". After re-enabling, force a bus rescan so Windows re-reads its descriptors.
                 string script = @"
 $ErrorActionPreference = 'Stop'
 try {
@@ -227,16 +270,18 @@ try {
     $h = Get-PnpDevice -InstanceId $id -ErrorAction Stop
     Write-Host ('Power-cycling hub ' + $id + ' (' + $h.FriendlyName + ')')
     Disable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction Stop
-    Write-Host 'Hub disabled (port power removed)'
-    Start-Sleep -Seconds 3
+    Write-Host 'Hub disabled - waiting 12s for the dongle to fully power down...'
+    Start-Sleep -Seconds 12
     Enable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction Stop
     Write-Host 'Hub enabled (port re-powered)'
+    Start-Sleep -Seconds 3
+    try { & pnputil /scan-devices | Out-Null } catch {}
     Start-Sleep -Seconds 4
     Write-Host 'Hub power-cycle complete'
     exit 0
 } catch { Write-Host ('Error: ' + $_); exit 3 }";
                 log("   Power-cycling the dongle's hub " + hubInstanceId + " ...");
-                var (exit, outp, err) = await RunPowerShellAsync(script, 30000, ct).ConfigureAwait(false);
+                var (exit, outp, err) = await RunPowerShellAsync(script, 30000, ct, killOnCancel: false).ConfigureAwait(false);
                 string o = outp.Trim();
                 if (o.Length > 0) log("   " + o.Replace("\n", "\n   "));
                 if (exit == 0) { log("   Hub power-cycled (you should hear the USB chime)."); return true; }
@@ -292,7 +337,10 @@ try {
             return list;
         }
 
-        internal static async Task<(int exit, string outp, string err)> RunPowerShellAsync(string script, int timeoutMs, CancellationToken ct)
+        // killOnCancel=false for disable/enable scripts: killing powershell AFTER the disable but
+        // BEFORE the enable would leave the dongle Disabled forever. Those scripts are short, so on
+        // cancel we let them finish (bounded by the timeout) rather than risk a stuck-disabled device.
+        internal static async Task<(int exit, string outp, string err)> RunPowerShellAsync(string script, int timeoutMs, CancellationToken ct, bool killOnCancel = true)
         {
             string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
             var psi = new ProcessStartInfo
@@ -307,7 +355,9 @@ try {
 
             using var process = Process.Start(psi);
             if (process == null) return (-1, string.Empty, "could not start powershell.exe");
-            using var reg = ct.Register(() => { try { process.Kill(entireProcessTree: true); } catch { } });
+            using var reg = killOnCancel
+                ? ct.Register(() => { try { process.Kill(entireProcessTree: true); } catch { } })
+                : (IDisposable)new NoopDisposable();
 
             Task<string> outTask = process.StandardOutput.ReadToEndAsync();
             Task<string> errTask = process.StandardError.ReadToEndAsync();
@@ -318,7 +368,7 @@ try {
                 try { process.Kill(entireProcessTree: true); } catch { }
                 return (-2, string.Empty, "reset timed out");
             }
-            ct.ThrowIfCancellationRequested();
+            if (killOnCancel) ct.ThrowIfCancellationRequested();
 
             string o = string.Empty, e = string.Empty;
             try { o = await outTask.ConfigureAwait(false); } catch { }
@@ -327,5 +377,7 @@ try {
         }
 
         private static string EscapePsSingleQuoted(string value) => value.Replace("'", "''");
+
+        private sealed class NoopDisposable : IDisposable { public void Dispose() { } }
     }
 }
