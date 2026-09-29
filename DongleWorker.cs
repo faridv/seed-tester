@@ -8,12 +8,26 @@ using System.Threading.Tasks;
 
 namespace RockeyPasswordTester
 {
+    // How the connected dongles are used across a run.
+    public enum DongleMode
+    {
+        Tandem,      // one dongle at a time; switch to the next only if the current one fails
+        RoundRobin,  // rotate dongles in fixed chunks (still one at a time)
+        Parallel     // all at once (experimental: the SDK serialises, so no speed-up yet)
+    }
+
+    // Live state of a dongle, shown in the per-dongle panel.
+    public enum WorkerState { Ready, Opening, Working, Recovering, Stopped, Done }
+
     // A source of seeds to test. Per-dongle sources (brute-force sub-range, dictionary slice) are
     // used by a single thread and need no locking; the repair source is shared by all workers and
     // hands out missing seeds under a lock so each seed is tested exactly once.
     internal abstract class SeedSource
     {
         public abstract bool TryGetNext(out string seed);
+        // True once the sequence has run out. Lets the coordinator tell "the whole range is done" from
+        // "a dongle failed but there is still work left" (in which case another dongle takes over).
+        public bool Exhausted { get; protected set; }
 
         public static SeedSource FromEnumerable(IEnumerable<string> seq, bool shared) =>
             new EnumeratorSeedSource(seq, shared);
@@ -34,11 +48,11 @@ namespace RockeyPasswordTester
                     lock (_lock)
                     {
                         if (_e.MoveNext()) { seed = _e.Current; return true; }
-                        seed = string.Empty; return false;
+                        Exhausted = true; seed = string.Empty; return false;
                     }
                 }
                 if (_e.MoveNext()) { seed = _e.Current; return true; }
-                seed = string.Empty; return false;
+                Exhausted = true; seed = string.Empty; return false;
             }
         }
     }
@@ -89,9 +103,11 @@ namespace RockeyPasswordTester
             public bool SerializeSeedCalls;       // make RY_SEED exclusive too (kills concurrency; use if concurrent seeds corrupt)
             public bool AllowHubCycle;            // opt-in: last-resort power-cycle of the dongle's parent hub
             public bool IsRepair;
+            public long ChunkLimit;               // round-robin: yield after this many seeds this turn (0 = unlimited)
             public Action<string> Log = _ => { };
             public Func<bool> IsPaused = () => false;
             public Action<DongleWorker>? OnMatch;
+            public Action<int, WorkerState>? OnState; // reports this dongle's state to the UI panel
         }
 
         private readonly Config _cfg;
@@ -111,7 +127,10 @@ namespace RockeyPasswordTester
         public string Status => _status;
         public bool Finished { get; private set; }
         public bool Failed { get; private set; }
+        public bool Yielded { get; private set; } // ran its chunk (round-robin); source not exhausted
         public string FailReason { get; private set; } = string.Empty;
+
+        private void SetState(WorkerState s) { _status = s.ToString(); try { _cfg.OnState?.Invoke(_cfg.Index, s); } catch { } }
         public string? MatchSeed { get; private set; }
         public string? MatchPassword { get; private set; }
         public int Index => _cfg.Index;
@@ -160,30 +179,31 @@ namespace RockeyPasswordTester
 
                 OpenLog();
 
-                _status = "Opening dongle...";
+                SetState(WorkerState.Opening);
                 if (!EnsureOpenWithRecovery())
                 {
                     Failed = true;
                     FailReason = "could not open the dongle";
-                    _status = "Failed: dongle not opened";
-                    _cfg.Log($"[Dongle {_cfg.Index}] Could not open {PhysId} after retries. UNPLUG & REPLUG that dongle. This one is stopped; others continue.");
+                    SetState(WorkerState.Stopped);
+                    _cfg.Log($"[Dongle {_cfg.Index}] Could not open {PhysId} after retries. UNPLUG & REPLUG that dongle.");
                     return;
                 }
 
                 _cfg.Log($"[Dongle {_cfg.Index}] Connected: {PhysId} (handle 0x{_handle:X4}). Testing...");
-                _status = "Testing";
+                SetState(WorkerState.Working);
                 RunLoop();
 
-                if (_ct.IsCancellationRequested) _status = "Stopped";
-                else if (Failed) _status = "Failed: " + FailReason;
-                else { Finished = true; _status = "Done"; }
+                if (_ct.IsCancellationRequested) SetState(WorkerState.Stopped);
+                else if (Failed) SetState(WorkerState.Stopped);
+                else if (Yielded) SetState(WorkerState.Ready); // chunk done; will run again on its next turn
+                else { Finished = true; SetState(WorkerState.Done); }
             }
-            catch (OperationCanceledException) { _status = "Stopped"; }
+            catch (OperationCanceledException) { SetState(WorkerState.Stopped); }
             catch (Exception ex)
             {
                 Failed = true;
                 FailReason = ex.Message;
-                _status = "Error: " + ex.Message;
+                SetState(WorkerState.Stopped);
                 _cfg.Log($"[Dongle {_cfg.Index}] Error: {ex.Message}");
             }
             finally
@@ -204,14 +224,24 @@ namespace RockeyPasswordTester
         private void RunLoop()
         {
             int consecutiveErrors = 0;
+            long thisTurn = 0; // seeds tested this activation (for round-robin chunking)
 
             while (!_ct.IsCancellationRequested)
             {
                 WaitWhilePaused();
                 if (_ct.IsCancellationRequested) break;
 
+                // Round-robin: hand the turn to the next dongle after our chunk. The source is NOT
+                // exhausted, so mark Yielded (not Done) - the coordinator will bring us back.
+                if (_cfg.ChunkLimit > 0 && thisTurn >= _cfg.ChunkLimit)
+                {
+                    Yielded = true;
+                    break;
+                }
+
                 if (!_cfg.Source.TryGetNext(out string seed))
                     break; // range/list/repair set exhausted for this worker
+                thisTurn++;
 
                 if (!SeedUtil.TryConvertSeedToUint(seed, out uint seedValue))
                 {
@@ -245,12 +275,12 @@ namespace RockeyPasswordTester
                     continue;
 
                 _cfg.Log($"[Dongle {_cfg.Index}] Stopped responding ({consecutiveErrors} seeds in a row failed, last code {rc}) around {seed}. Recovering...");
-                _status = "Recovering";
+                SetState(WorkerState.Recovering);
                 bool recovered = RecoverDongle();
                 if (recovered)
                 {
                     _cfg.Log($"[Dongle {_cfg.Index}] Recovered - the dongle is generating passwords again. Continuing.");
-                    _status = "Testing";
+                    SetState(WorkerState.Working);
                     consecutiveErrors = 0;
                     continue;
                 }
