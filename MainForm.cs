@@ -42,22 +42,11 @@ namespace RockeyPasswordTester
         private DongleMode _dongleMode = DongleMode.Tandem;
         private const long ROUND_ROBIN_CHUNK = 1000; // seeds per dongle turn in round-robin
 
-        // Multi-dongle / repair controls, built in code so the generated Designer layout is untouched.
-        private GroupBox grpMultiDongle = null!;
-        private ListView lvDongles = null!;          // per-dongle panel: checkbox + icon + HID + port + state
-        private ImageList _statusIcons = null!;      // colored dots, one per WorkerState
-        private RadioButton radTandem = null!, radRoundRobin = null!, radParallel = null!;
-        private Button btnDetectDongles = null!;
-        private Label lblDongleDetected = null!;
-        private TextBox txtStartSeed = null!;
-        private TextBox txtStopSeed = null!;
-        private CheckBox chkSerialize = null!;
-        private CheckBox chkHubRecover = null!;
-        private Button btnResetSafe = null!;
-        private Button btnCycleHub = null!;
-        private Label lblMultiHint = null!;
-        private Button btnModeRepair = null!;
-        private CheckBox chkDemo = null!;
+        // Every visual control now lives in MainForm.Designer.cs so it is editable in VS design mode.
+        // These two are code-only: the status-icon image list is generated at runtime, and _syncingTab
+        // guards the tab <-> mode two-way binding.
+        private ImageList _statusIcons = null!;
+        private bool _syncingTab;
 
         // One entry in the dongle picker. Index is the SDK enumeration position; Hid binds to the
         // exact dongle regardless of order; UsbInstanceId (best-effort) pairs it with a Windows device
@@ -90,9 +79,8 @@ namespace RockeyPasswordTester
             _uiTimer = new System.Windows.Forms.Timer { Interval = 1000 };
             _uiTimer.Tick += UiTimer_Tick;
             UiTotal = 0;
-            AddDemoCheckbox();
-            BuildMultiDongleUi();
-            SetMode(TestMode.Dictionary); // initial styling + enabled state
+            InitDesignerControls();
+            SetMode(TestMode.BruteForce); // default active tab = Brute-Force
             // Self-heal: a previous run's interrupted reset can leave a dongle Disabled in Windows,
             // and it never comes back on its own. Re-enable any such dongle at startup (off the UI
             // thread - it spawns powershell). The app is elevated (manifest) so Enable-PnpDevice works.
@@ -136,157 +124,59 @@ namespace RockeyPasswordTester
         private static readonly (string P1, string P2, string P3, string P4) DefaultParams = ("530A", "00FC", "CB51", "8C4E");
         private static readonly (string P1, string P2, string P3, string P4) DemoParams = ("C44C", "C8F8", "CB51", "8C4E");
 
-        // Adds a "Demo" checkbox under the P1-P4 inputs. Checked fills them with the demo password
-        // C44C C8F8 CB51 8C4E; unchecked restores the defaults. The P1-P4 group is grown a little and
-        // everything below it nudged down so nothing overlaps.
-        private void AddDemoCheckbox()
+        // Runtime wiring for controls that the Designer can't fully set up: the generated status-icon
+        // image list, the initial dongle row, tooltips, and the Demo-checkbox initial state.
+        private void InitDesignerControls()
         {
-            const int delta = 26;
-            int threshold = grpMode.Top; // shift this row and everything below it
+            _statusIcons = BuildStatusIcons();
+            lvDongles.SmallImageList = _statusIcons;
+            AddDongleRow(DongleOption.FirstFound()); // a sensible default before Detect is clicked
 
-            grpDongleParams.Height += delta;
-            chkDemo = new CheckBox { Text = "Demo", AutoSize = true, Location = new Point(10, 90) };
-            var tt = new ToolTip();
-            tt.SetToolTip(chkDemo, "Fill P1-P4 with the demo values C44C C8F8 CB51 8C4E. Uncheck to restore the defaults (530A 00FC CB51 8C4E).");
-            chkDemo.CheckedChanged += chkDemo_CheckedChanged;
-            grpDongleParams.Controls.Add(chkDemo);
+            var tt = new ToolTip { AutoPopDelay = 20000 };
+            tt.SetToolTip(chkDemo, "Demo dongle parameters (C44C C8F8 CB51 8C4E). While checked, P1-P4 are locked. Uncheck to enter your own params.");
+            tt.SetToolTip(radTandem, "Use ONE dongle at a time; if it stops responding, automatically switch to the next. Most reliable.");
+            tt.SetToolTip(radRoundRobin, $"Rotate dongles one at a time, {ROUND_ROBIN_CHUNK:N0} seeds each turn. Still one dongle at a time.");
+            tt.SetToolTip(radParallel, "Drive all dongles at once. Experimental: the SDK serialises calls, so little/no speed-up and less stable.");
+            tt.SetToolTip(lvDongles, "Connected dongles. Tick the ones to use. The icon and State column update live.");
+            tt.SetToolTip(btnResetSafe, "Restart only the dongle's own device node. Never touches a hub. Fixes soft wedges.");
+            tt.SetToolTip(btnCycleHub, "Power-cycle the dongle's parent hub to recover a hard wedge. Asks first. Never cycles a root hub.");
+            tt.SetToolTip(chkHubRecover, "Last-resort recovery: re-power the dongle's hub on a hard wedge. Only safe on a dedicated hub.");
 
-            foreach (Control ctl in Controls)
-                if (ctl.Top >= threshold) ctl.Top += delta;
-            ClientSize = new Size(ClientSize.Width, ClientSize.Height + delta);
+            chkDemo_CheckedChanged(this, EventArgs.Empty); // apply the default (checked -> demo values, P1-P4 locked)
         }
 
+        // Demo checked: fill P1-P4 with the demo values and lock them. Unchecked: restore the defaults
+        // and let the user edit them.
         private void chkDemo_CheckedChanged(object? sender, EventArgs e)
         {
             var p = chkDemo.Checked ? DemoParams : DefaultParams;
             txtP1.Text = p.P1; txtP2.Text = p.P2; txtP3.Text = p.P3; txtP4.Text = p.P4;
+            bool editable = !chkDemo.Checked;
+            txtP1.Enabled = editable; txtP2.Enabled = editable; txtP3.Enabled = editable; txtP4.Enabled = editable;
         }
+
+        private void radMode_CheckedChanged(object? sender, EventArgs e)
+        {
+            if (radTandem.Checked) _dongleMode = DongleMode.Tandem;
+            else if (radRoundRobin.Checked) _dongleMode = DongleMode.RoundRobin;
+            else if (radParallel.Checked) _dongleMode = DongleMode.Parallel;
+        }
+
+        private void tabsMode_SelectedIndexChanged(object? sender, EventArgs e)
+        {
+            if (_syncingTab) return;
+            SetMode(tabsMode.SelectedIndex == 0 ? TestMode.Dictionary
+                  : tabsMode.SelectedIndex == 1 ? TestMode.BruteForce
+                  : TestMode.Repair);
+        }
+
+        private async void btnResetSafe_Click(object? sender, EventArgs e) => await ManualSafeResetAsync();
+        private async void btnCycleHub_Click(object? sender, EventArgs e) => await ManualHubCycleAsync();
 
         private long UiTotal
         {
             get { lock (_uiTotalLock) { return _uiTotal; } }
             set { lock (_uiTotalLock) { _uiTotal = value; } }
-        }
-
-        // ---- UI construction (multi-dongle group + Repair mode button) ---------------------------
-
-        private void BuildMultiDongleUi()
-        {
-            int groupTop = grpResults.Location.Y; // where grpResults currently sits (after any earlier shifts)
-            const int groupHeight = 232;
-            const int shift = groupHeight + 8;
-
-            grpMultiDongle = new GroupBox
-            {
-                Text = "Dongles & Recovery",
-                Location = new Point(13, groupTop),
-                Size = new Size(730, groupHeight),
-                TabStop = false
-            };
-
-            var toolTip = new ToolTip { AutoPopDelay = 20000 };
-
-            btnDetectDongles = new Button { Text = "Detect Dongles", Location = new Point(8, 20), Size = new Size(120, 26) };
-            btnDetectDongles.Click += btnDetectDongles_Click;
-
-            // Mode selector
-            var lblMulti = new Label { Text = "Mode:", AutoSize = true, Location = new Point(146, 25) };
-            radTandem = new RadioButton { Text = "Tandem", AutoSize = true, Location = new Point(190, 23), Checked = true };
-            toolTip.SetToolTip(radTandem, "Use ONE dongle at a time; if it stops responding, automatically switch to the next connected dongle. Most reliable.");
-            radRoundRobin = new RadioButton { Text = "Round-robin", AutoSize = true, Location = new Point(270, 23) };
-            toolTip.SetToolTip(radRoundRobin, $"Rotate dongles one at a time, {ROUND_ROBIN_CHUNK:N0} seeds each turn. Spreads wear evenly; still one dongle at a time.");
-            radParallel = new RadioButton { Text = "Parallel (experimental)", AutoSize = true, Location = new Point(370, 23) };
-            toolTip.SetToolTip(radParallel, "Drive all dongles at once. Experimental: the SDK serialises calls, so this currently gives little or no speed-up and can be less stable.");
-            radTandem.CheckedChanged += (s, e) => { if (radTandem.Checked) _dongleMode = DongleMode.Tandem; };
-            radRoundRobin.CheckedChanged += (s, e) => { if (radRoundRobin.Checked) _dongleMode = DongleMode.RoundRobin; };
-            radParallel.CheckedChanged += (s, e) => { if (radParallel.Checked) _dongleMode = DongleMode.Parallel; };
-
-            // Per-dongle status panel: checkbox (use it) + colored icon + HID + port + live state.
-            _statusIcons = BuildStatusIcons();
-            lvDongles = new ListView
-            {
-                Location = new Point(8, 52),
-                Size = new Size(500, 110),
-                View = View.Details,
-                CheckBoxes = true,
-                FullRowSelect = true,
-                HeaderStyle = ColumnHeaderStyle.Nonclickable,
-                SmallImageList = _statusIcons
-            };
-            lvDongles.Columns.Add("#", 30);
-            lvDongles.Columns.Add("HID", 110);
-            lvDongles.Columns.Add("Port", 170);
-            lvDongles.Columns.Add("State", 170);
-            toolTip.SetToolTip(lvDongles, "Connected dongles. Tick the ones to use. The icon and 'State' column show each dongle live (Ready / Working / Recovering / Stopped / Done).");
-
-            lblDongleDetected = new Label
-            {
-                Text = "Click 'Detect Dongles' to list connected dongles.",
-                AutoSize = false,
-                Location = new Point(516, 52),
-                Size = new Size(206, 110),
-                ForeColor = Color.Gray
-            };
-
-            var lblStartSeed = new Label { Text = "Start seed:", AutoSize = true, Location = new Point(8, 174) };
-            txtStartSeed = new TextBox { Location = new Point(78, 171), Size = new Size(84, 23), CharacterCasing = CharacterCasing.Upper, MaxLength = 8 };
-            toolTip.SetToolTip(txtStartSeed, "Brute-force / repair: 8-hex start of the range. Empty = beginning. The run continues from the log's last seed if that is further along.");
-
-            var lblStopSeed = new Label { Text = "Stop before:", AutoSize = true, Location = new Point(172, 174) };
-            txtStopSeed = new TextBox { Location = new Point(250, 171), Size = new Size(84, 23), CharacterCasing = CharacterCasing.Upper, MaxLength = 8 };
-            toolTip.SetToolTip(txtStopSeed, "Brute-force / repair: 8-hex end of the range (exclusive). Empty = end of the charset space, or parsed from the log filename in Repair mode.");
-
-            chkSerialize = new CheckBox { Text = "Serialize I/O", AutoSize = true, Location = new Point(352, 173) };
-            toolTip.SetToolTip(chkSerialize, "Parallel mode only: force one dongle call at a time if concurrent access corrupts results. No effect in tandem/round-robin (already one at a time).");
-
-            chkHubRecover = new CheckBox { Text = "Hub power-cycle on wedge", AutoSize = true, Location = new Point(452, 173) };
-            toolTip.SetToolTip(chkHubRecover,
-                "Last-resort recovery for a hard wedge. Re-powers the dongle's PARENT HUB, briefly disconnecting every device on that hub. " +
-                "Never cycles a root hub. Safe only when the dongle is on a dedicated hub.");
-
-            var lblRecovery = new Label { Text = "Recovery:", AutoSize = true, Location = new Point(8, 204) };
-            btnResetSafe = new Button { Text = "Reset Dongle", Location = new Point(78, 200), Size = new Size(120, 26) };
-            btnResetSafe.Click += async (s, e) => await ManualSafeResetAsync();
-            toolTip.SetToolTip(btnResetSafe, "Restart ONLY the Rockey dongle's own device node. Never touches a hub, so it cannot disturb other devices. Fixes soft wedges.");
-
-            btnCycleHub = new Button { Text = "Cycle Dongle Hub", Location = new Point(204, 200), Size = new Size(140, 26) };
-            btnCycleHub.Click += async (s, e) => await ManualHubCycleAsync();
-            toolTip.SetToolTip(btnCycleHub, "Power-cycle the dongle's parent hub (re-powers its port) to recover a hard wedge a device reset can't. Lists what's on the hub and asks first. Never cycles a root hub.");
-
-            lblMultiHint = new Label
-            {
-                Text = "Tandem is the most reliable. If a dongle wedges the app recovers automatically (reset → resume), and only asks you to replug if that fails.",
-                AutoSize = false,
-                Location = new Point(352, 200),
-                Size = new Size(370, 28),
-                ForeColor = Color.Gray
-            };
-
-            grpMultiDongle.Controls.AddRange(new Control[]
-            {
-                btnDetectDongles, lblMulti, radTandem, radRoundRobin, radParallel,
-                lvDongles, lblDongleDetected,
-                lblStartSeed, txtStartSeed, lblStopSeed, txtStopSeed, chkSerialize, chkHubRecover,
-                lblRecovery, btnResetSafe, btnCycleHub, lblMultiHint
-            });
-            Controls.Add(grpMultiDongle);
-
-            // A third mode button next to Dictionary / Brute-Force, and relocate the mode caption.
-            btnModeRepair = new Button
-            {
-                Text = "Fix Missing (Repair)",
-                Location = new Point(372, 22),
-                Size = new Size(175, 27),
-                UseVisualStyleBackColor = true
-            };
-            btnModeRepair.Click += btnModeRepair_Click;
-            grpMode.Controls.Add(btnModeRepair);
-            lblMode.Location = new Point(556, 27);
-            lblMode.AutoEllipsis = true;
-
-            // Push the Results group down and grow the form so nothing overlaps.
-            grpResults.Location = new Point(grpResults.Location.X, groupTop + shift);
-            ClientSize = new Size(ClientSize.Width, ClientSize.Height + shift);
         }
 
         // ---- Simple UI event handlers -------------------------------------------------------------
@@ -310,54 +200,21 @@ namespace RockeyPasswordTester
             if (sfd.ShowDialog() == DialogResult.OK) txtLogFile.Text = sfd.FileName;
         }
 
-        private void btnModeDictionary_Click(object sender, EventArgs e) => SetMode(TestMode.Dictionary);
-        private void btnModeBruteForce_Click(object sender, EventArgs e) => SetMode(TestMode.BruteForce);
-        private void btnModeRepair_Click(object? sender, EventArgs e) => SetMode(TestMode.Repair);
-
         private void SetMode(TestMode mode)
         {
             _testMode = mode;
-            StyleModeButton(btnModeDictionary, mode == TestMode.Dictionary);
-            StyleModeButton(btnModeBruteForce, mode == TestMode.BruteForce);
-            StyleModeButton(btnModeRepair, mode == TestMode.Repair);
 
-            grpSeedList.Enabled = mode == TestMode.Dictionary;
-            grpBruteForceSettings.Enabled = mode == TestMode.BruteForce;
+            // Keep the tab in sync when the mode is set programmatically (e.g. auto-resume, startup).
+            int want = mode == TestMode.Dictionary ? 0 : mode == TestMode.BruteForce ? 1 : 2;
+            if (tabsMode.SelectedIndex != want)
+            {
+                _syncingTab = true;
+                try { tabsMode.SelectedIndex = want; } finally { _syncingTab = false; }
+            }
+
             grpTargetPassword.Enabled = mode != TestMode.Repair;
-
-            switch (mode)
-            {
-                case TestMode.Dictionary:
-                    lblMode.Text = "Mode: Dictionary (File)";
-                    btnTest.Text = "Start Testing";
-                    break;
-                case TestMode.BruteForce:
-                    lblMode.Text = "Mode: Brute-Force";
-                    btnTest.Text = "Start Testing";
-                    break;
-                case TestMode.Repair:
-                    lblMode.Text = "Mode: Repair log";
-                    btnTest.Text = "Scan & Fix Missing";
-                    AutoFillRepairRange();
-                    break;
-            }
-        }
-
-        private static void StyleModeButton(Button btn, bool active)
-        {
-            if (active)
-            {
-                btn.FlatStyle = FlatStyle.Flat;
-                btn.FlatAppearance.BorderColor = Color.FromArgb(0, 120, 215);
-                btn.FlatAppearance.BorderSize = 2;
-                btn.Font = new Font(btn.Font, FontStyle.Bold);
-            }
-            else
-            {
-                btn.FlatStyle = FlatStyle.Standard;
-                btn.FlatAppearance.BorderSize = 0;
-                btn.Font = new Font(btn.Font, FontStyle.Regular);
-            }
+            btnTest.Text = mode == TestMode.Repair ? "Scan & Fix Missing" : "Start Testing";
+            if (mode == TestMode.Repair) AutoFillRepairRange();
         }
 
         // In Repair mode, prefill the start/stop range from a "XXXXXXXX_YYYYYYYY.csv" filename.
@@ -917,6 +774,7 @@ namespace RockeyPasswordTester
                 SdkLock = _sdkLock,
                 SerializeSeedCalls = chkSerialize.Checked,
                 AllowHubCycle = chkHubRecover.Checked,
+                LogEachSeedToUi = _speedMode != SpeedMode.Fast, // Balanced/Slow echo every seed to Results
                 Log = AppendResult,
                 IsPaused = () => _isPaused,
                 OnMatch = OnWorkerMatch,
@@ -1027,16 +885,6 @@ namespace RockeyPasswordTester
             });
         }
 
-        // password_log.csv -> password_log.d0.csv (only when running more than one dongle).
-        private static string DeriveLogPath(string basePath, int pos, int n)
-        {
-            if (n <= 1) return basePath;
-            string dir = Path.GetDirectoryName(basePath) ?? "";
-            string name = Path.GetFileNameWithoutExtension(basePath);
-            string ext = Path.GetExtension(basePath);
-            return Path.Combine(dir, $"{name}.d{pos}{ext}");
-        }
-
         // 11111111_22222222.csv -> 11111111_22222222.repaired.csv (or .repaired.dN.csv for many dongles).
         private static string DeriveRepairPath(string basePath, int pos, int n)
         {
@@ -1057,7 +905,7 @@ namespace RockeyPasswordTester
             btnPauseResume.Text = "Pause";
             btnClear.Enabled = !running;
             grpMultiDongle.Enabled = !running;
-            grpMode.Enabled = !running;
+            tabsMode.Enabled = !running;
         }
 
         private void ResetStatLabels()

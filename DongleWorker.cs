@@ -103,6 +103,7 @@ namespace RockeyPasswordTester
             public bool SerializeSeedCalls;       // make RY_SEED exclusive too (kills concurrency; use if concurrent seeds corrupt)
             public bool AllowHubCycle;            // opt-in: last-resort power-cycle of the dongle's parent hub
             public bool IsRepair;
+            public bool LogEachSeedToUi;          // Balanced/Slow: echo every tested seed + password to the Results box
             public long ChunkLimit;               // round-robin: yield after this many seeds this turn (0 = unlimited)
             public Action<string> Log = _ => { };
             public Func<bool> IsPaused = () => false;
@@ -270,6 +271,7 @@ namespace RockeyPasswordTester
                 WriteRow(seed, "ERROR", 0, 0, 0, 0, $"ERROR_{rc}", false);
                 Interlocked.Increment(ref _tested);
                 _lastSeed = seed;
+                if (_cfg.LogEachSeedToUi) _cfg.Log($"[D{_cfg.Index}] {seed}  ->  ERROR_{rc}");
                 consecutiveErrors++;
                 if (consecutiveErrors < WEDGE_THRESHOLD)
                     continue;
@@ -316,6 +318,7 @@ namespace RockeyPasswordTester
             Interlocked.Increment(ref _generated);
             Interlocked.Increment(ref _verified);
             _lastSeed = seed;
+            if (_cfg.LogEachSeedToUi) _cfg.Log($"[D{_cfg.Index}] {seed}  ->  {pw}");
 
             if (!string.IsNullOrEmpty(_cfg.TargetPassword) &&
                 pw.Equals(_cfg.TargetPassword, StringComparison.OrdinalIgnoreCase))
